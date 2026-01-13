@@ -51,29 +51,39 @@ def main():
                 img = img.resize((args.width, h_size), Image.Resampling.LANCZOS)
                 print(f"Resized to: {img.size[0]}x{img.size[1]}")
 
+            # Create output directory if it doesn't exist
+            import os
+            output_dir = "output"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            base_name = os.path.basename(args.image_path)
+
             if args.format in ['asm', 'all']:
                 print("\n--- ASM (db array start) ---")
                 print(image_to_asm(img)[:500] + "\n... (truncated for display)")
-                # In a real scenario, you might want to write this to a file
-                with open(args.image_path + ".asm", "w") as f:
+                output_path = os.path.join(output_dir, base_name + ".asm")
+                with open(output_path, "w") as f:
                     f.write(image_to_asm(img))
-                print(f"Saved ASM to {args.image_path}.asm")
+                print(f"Saved ASM to {output_path}")
 
             if args.format in ['binary', 'all']:
                 print("\n--- Binary String (start) ---")
                 bin_str = image_to_binary_string(img)
                 print(bin_str[:100] + "...")
-                with open(args.image_path + ".bin.txt", "w") as f:
+                output_path = os.path.join(output_dir, base_name + ".bin.txt")
+                with open(output_path, "w") as f:
                     f.write(bin_str)
-                print(f"Saved Binary String to {args.image_path}.bin.txt")
+                print(f"Saved Binary String to {output_path}")
 
             if args.format in ['string', 'all']:
                 print("\n--- Base64 String (start) ---")
                 b64_str = image_to_base64(img)
                 print(b64_str[:100] + "...")
-                with open(args.image_path + ".b64.txt", "w") as f:
+                output_path = os.path.join(output_dir, base_name + ".b64.txt")
+                with open(output_path, "w") as f:
                     f.write(b64_str)
-                print(f"Saved Base64 String to {args.image_path}.b64.txt")
+                print(f"Saved Base64 String to {output_path}")
 
     except FileNotFoundError:
         print(f"Error: File not found at {args.image_path}")
