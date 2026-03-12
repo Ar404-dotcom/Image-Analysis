@@ -1,0 +1,15 @@
+$payload = "C:\Users\HP\OneDrive\Desktop\Image analysis\payload.txt"
+@'
+; x64 connect syscall test
+mov rax, 42
+syscall
+
+; x86 execve syscall test
+mov eax, 11
+int 0x80
+
+; socket setup window test
+push 2
+push 1
+syscall
+'@ | Set-Content -Path $payload -NoNewline
