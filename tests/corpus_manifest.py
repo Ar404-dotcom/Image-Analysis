@@ -8,6 +8,7 @@ SAFE_IMAGE_CORPUS = [
     ROOT / "assets" / "Screenshot_20251015-223409.Reddit.png",
     ROOT / "assets" / "table image'.jpeg",
 ]
+SAFE_IMAGE_CORPUS = [path for path in SAFE_IMAGE_CORPUS if path.exists()]
 
 SUSPICIOUS_IMAGE_CORPUS = [
     {

@@ -1,3 +1,4 @@
 Pillow
 capstone
 streamlit
+numpy
