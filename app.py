@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import platform
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -11,6 +12,7 @@ import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
 from converter import image_to_asm, image_to_base64, image_to_binary_string
+from live_monitor import MonitorConfig, WindowsBehaviorMonitor
 from malware_scanner import MalwareScanner
 
 
@@ -178,6 +180,20 @@ def risk_band(score: int) -> tuple[str, str]:
     return "Clean", "#256245"
 
 
+def behavior_risk_band(summary: dict) -> tuple[str, str]:
+    score = int(summary.get("risk_score", 0))
+    severities = summary.get("severity_counts", {})
+    if severities.get("CRITICAL", 0) or score >= 100:
+        return "Critical", "#8a2d1d"
+    if severities.get("HIGH", 0) or score >= 35:
+        return "High", "#b64d1f"
+    if severities.get("MEDIUM", 0) or score >= 20:
+        return "Medium", "#bd7c16"
+    if severities.get("LOW", 0) or score > 0:
+        return "Low", "#567a12"
+    return "Clean", "#256245"
+
+
 def open_uploaded_image(uploaded_file) -> Image.Image | None:
     try:
         image = Image.open(io.BytesIO(uploaded_file.getvalue()))
@@ -224,6 +240,31 @@ def scan_uploaded_file(uploaded_file) -> tuple[dict | None, str]:
     return result, buffer.getvalue()
 
 
+def scan_local_file(path: Path) -> tuple[dict | None, str]:
+    scanner = MalwareScanner()
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        result = scanner.scan_file(str(path))
+    return result, buffer.getvalue()
+
+
+def ensure_true_positive_image_sample() -> Path:
+    output_path = Path("output") / "true_positive_embedded_pe.png"
+    output_path.parent.mkdir(exist_ok=True)
+
+    image = Image.new("RGB", (64, 64), color=(42, 90, 140))
+    image.save(output_path)
+
+    pe_stub = bytearray(256)
+    pe_stub[0:2] = b"MZ"
+    pe_stub[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    pe_stub[0x80:0x84] = b"PE\x00\x00"
+    with output_path.open("ab") as handle:
+        handle.write(pe_stub)
+
+    return output_path
+
+
 def render_hero() -> None:
     st.markdown(
         """
@@ -231,12 +272,14 @@ def render_hero() -> None:
             <h1>Image Analysis Workbench</h1>
             <p>
                 A focused frontend for converting images into low-level representations
-                and triaging suspicious image, ASM, and polyglot files with clearer signals.
+                triaging suspicious image, ASM, and polyglot files, and running bounded
+                Windows behavior monitoring sessions.
             </p>
             <div class="pill-row">
                 <div class="pill">Image preview</div>
                 <div class="pill">ASM / Binary / Base64 export</div>
                 <div class="pill">Malware risk scoring</div>
+                <div class="pill">Live monitoring</div>
                 <div class="pill">Finding breakdowns</div>
             </div>
         </div>
@@ -329,6 +372,29 @@ def render_scanner_tab() -> None:
     st.markdown("### Scan Files")
     st.caption("Analyze images, ASM, or extracted text blobs and inspect the risk breakdown instead of reading raw terminal output.")
 
+    test_col, upload_col = st.columns([0.75, 1.25], gap="large")
+    with test_col:
+        if st.button("Run true-positive image self-test", use_container_width=True):
+            sample_path = ensure_true_positive_image_sample()
+            with st.spinner("Scanning controlled PE-in-PNG sample..."):
+                result, console_output = scan_local_file(sample_path)
+            st.session_state["scanner_self_test"] = {
+                "path": str(sample_path),
+                "result": result,
+                "console_output": console_output,
+            }
+
+    self_test = st.session_state.get("scanner_self_test")
+    if self_test:
+        sample_name = Path(self_test["path"]).name
+        st.info(f"Showing self-test report for {sample_name}. Upload a file below to run a normal scan.")
+        render_scan_result(
+            result=self_test["result"],
+            console_output=self_test["console_output"],
+            report_name=f"{Path(sample_name).stem}_scan_report.json",
+        )
+        st.divider()
+
     uploaded = st.file_uploader(
         "Upload a file to scan",
         type=["asm", "txt", "bin", "png", "jpg", "jpeg", "gif", "bmp", "webp"],
@@ -346,6 +412,21 @@ def render_scanner_tab() -> None:
     with st.spinner("Running scanner modules and correlating findings..."):
         result, console_output = scan_uploaded_file(uploaded)
 
+    if result is None:
+        st.error("The scan did not return a result.")
+        if console_output.strip():
+            st.code(console_output, language="text")
+        return
+
+    render_scan_result(
+        result=result,
+        console_output=console_output,
+        report_name=f"{Path(uploaded.name).stem}_scan_report.json",
+        uploaded_file=uploaded,
+    )
+
+
+def render_scan_result(result: dict | None, console_output: str, report_name: str, uploaded_file=None) -> None:
     if result is None:
         st.error("The scan did not return a result.")
         if console_output.strip():
@@ -382,7 +463,7 @@ def render_scanner_tab() -> None:
             unsafe_allow_html=True,
         )
     with top_c:
-        appended = "Yes" if is_known_image_upload(uploaded) else "No"
+        appended = "Yes" if uploaded_file is not None and is_known_image_upload(uploaded_file) else "Sample"
         st.markdown(
             f"""
             <div class="risk-card">
@@ -447,7 +528,161 @@ def render_scanner_tab() -> None:
     st.download_button(
         label="Download scan report",
         data=json.dumps(result, indent=2),
-        file_name=f"{Path(uploaded.name).stem}_scan_report.json",
+        file_name=report_name,
+        mime="application/json",
+    )
+
+
+def render_live_monitoring_tab() -> None:
+    st.markdown("### Live Monitoring")
+    st.caption("Run a bounded Windows behavior-monitoring session for process, thread, and private executable-memory signals.")
+
+    is_windows = platform.system() == "Windows"
+    if not is_windows:
+        st.warning("Live monitoring is Windows-only. This tab can be configured here, but sessions run only on Windows hosts.")
+
+    left, right = st.columns([1, 1], gap="large")
+    with left:
+        duration = st.slider("Session duration", min_value=5, max_value=120, value=20, step=5)
+        interval = st.slider("Polling interval", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
+        max_processes = st.slider("Memory scan budget", min_value=10, max_value=200, value=80, step=10)
+
+    with right:
+        inspect_threads = st.checkbox("Inspect new thread start addresses", value=True)
+        inspect_memory = st.checkbox("Inspect private executable memory", value=True)
+        include_process_starts = st.checkbox("Evaluate new process starts", value=True)
+
+    st.markdown(
+        """
+        <div class="panel">
+            The monitor runs in user mode and focuses on behavior: suspicious process chains,
+            thread starts inside private executable memory, process masquerading, and newly
+            observed executable private regions in sensitive processes.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    action_col, test_col = st.columns([1, 1], gap="large")
+    with action_col:
+        start = st.button("Start live monitoring session", type="primary", disabled=not is_windows, use_container_width=True)
+    with test_col:
+        run_self_test = st.button("Run detection self-test", use_container_width=True)
+
+    if start:
+        config = MonitorConfig(
+            duration_seconds=int(duration),
+            interval_seconds=float(interval),
+            inspect_thread_starts=inspect_threads,
+            inspect_memory_regions=inspect_memory,
+            max_processes_per_cycle=int(max_processes),
+            include_process_starts=include_process_starts,
+        )
+        monitor = WindowsBehaviorMonitor(config)
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        def update_progress(value: float) -> None:
+            progress.progress(value)
+            status.caption(f"Monitoring session progress: {int(value * 100)}%")
+
+        with st.spinner("Monitoring Windows process and memory behavior..."):
+            st.session_state["live_monitor_report"] = monitor.run(update_progress)
+
+    if run_self_test:
+        config = MonitorConfig(
+            duration_seconds=int(duration),
+            interval_seconds=float(interval),
+            inspect_thread_starts=inspect_threads,
+            inspect_memory_regions=inspect_memory,
+            max_processes_per_cycle=int(max_processes),
+            include_process_starts=include_process_starts,
+        )
+        st.session_state["live_monitor_report"] = WindowsBehaviorMonitor(config).self_test_report()
+
+    report = st.session_state.get("live_monitor_report")
+    if not report:
+        st.info("Start a session to collect live behavior events.")
+        return
+
+    if not report.get("supported", False):
+        st.error(report.get("message", "Live monitoring is not supported on this host."))
+        return
+
+    summary = report.get("summary", {})
+    configuration = report.get("configuration", {})
+    events = report.get("events", [])
+    score = int(summary.get("risk_score", 0))
+    level, color = behavior_risk_band(summary)
+    session_duration = int(configuration.get("duration_seconds", duration))
+
+    top_a, top_b, top_c = st.columns(3, gap="large")
+    with top_a:
+        st.markdown(
+            f"""
+            <div class="risk-card">
+                <h3>Behavior Risk</h3>
+                <div class="risk-value" style="color:{color};">{level}</div>
+                <div class="section-label">Score {score}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_b:
+        st.markdown(
+            f"""
+            <div class="risk-card">
+                <h3>Events</h3>
+                <div class="risk-value">{len(events)}</div>
+                <div class="section-label">Behavior signals</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_c:
+        st.markdown(
+            f"""
+            <div class="risk-card">
+                <h3>Session Window</h3>
+                <div class="risk-value">{session_duration}s</div>
+                <div class="section-label">{report.get("started_at", "")} UTC</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    severity_counts = summary.get("severity_counts", {})
+    sev_cols = st.columns(4)
+    for column, severity in zip(sev_cols, ["CRITICAL", "HIGH", "MEDIUM", "LOW"]):
+        with column:
+            st.metric(severity.title(), severity_counts.get(severity, 0))
+
+    if events:
+        st.markdown("#### Live Events")
+        rows = [
+            {
+                "Time": event["timestamp"],
+                "Severity": event["severity"],
+                "Category": event["category"],
+                "Process": event["process_name"],
+                "PID": event["pid"],
+                "Parent": event.get("parent_name", ""),
+                "Score": event["score"],
+                "Message": event["message"],
+            }
+            for event in events
+        ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        with st.expander("Event evidence JSON"):
+            st.code(json.dumps(events, indent=2), language="json")
+    else:
+        st.success("No suspicious live behavior was observed during this session.")
+
+    st.download_button(
+        label="Download monitoring report",
+        data=json.dumps(report, indent=2),
+        file_name="live_monitoring_report.json",
         mime="application/json",
     )
 
@@ -457,24 +692,28 @@ def main() -> None:
 
     with st.sidebar:
         st.title("Workbench")
-        st.write("A small frontend for the existing image converter and malware scanner.")
+        st.write("A small frontend for image conversion, static triage, and bounded Windows behavior monitoring.")
         st.markdown(
             """
             - Convert images into `ASM`, `binary`, and `base64`
             - Preview images before processing
             - Scan uploaded files and inspect finding severity
+            - Run Windows live monitoring sessions
             - Export structured JSON reports
             """
         )
 
     render_hero()
-    convert_tab, scan_tab = st.tabs(["Converter", "Scanner"])
+    convert_tab, scan_tab, monitor_tab = st.tabs(["Converter", "Scanner", "Live Monitoring"])
 
     with convert_tab:
         render_converter_tab()
 
     with scan_tab:
         render_scanner_tab()
+
+    with monitor_tab:
+        render_live_monitoring_tab()
 
 
 if __name__ == "__main__":
