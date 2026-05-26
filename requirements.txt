@@ -2,3 +2,4 @@ Pillow
 capstone
 streamlit
 numpy
+psutil

@@ -3,10 +3,18 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import re
+import shlex
+import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Iterable
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - exercised when optional dependency is absent.
+    psutil = None
 
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -18,6 +26,11 @@ class ProcessInfo:
     parent_pid: int
     name: str
     path: str = ""
+    command_line: str = ""
+    username: str = ""
+    create_time: float | None = None
+    signer_status: str = "UNKNOWN"
+    signer_subject: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,6 +124,7 @@ class WindowsApiProbe:
             raise OSError("Live monitoring is available on Windows only.")
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        self._signature_cache: dict[str, tuple[str, str]] = {}
         self._configure_prototypes()
         self.max_application_address = self._max_application_address()
 
@@ -232,6 +246,29 @@ class WindowsApiProbe:
             self._close(handle)
 
     def iter_processes(self) -> list[ProcessInfo]:
+        if psutil is not None:
+            processes: list[ProcessInfo] = []
+            attrs = ["pid", "ppid", "name", "exe", "cmdline", "username", "create_time"]
+            for process in psutil.process_iter(attrs):
+                try:
+                    info = process.info
+                    cmdline = info.get("cmdline") or []
+                    processes.append(
+                        ProcessInfo(
+                            pid=int(info.get("pid") or 0),
+                            parent_pid=int(info.get("ppid") or 0),
+                            name=info.get("name") or "",
+                            path=info.get("exe") or "",
+                            command_line=subprocess.list2cmdline(cmdline) if isinstance(cmdline, list) else str(cmdline),
+                            username=info.get("username") or "",
+                            create_time=info.get("create_time"),
+                        )
+                    )
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+            if processes:
+                return processes
+
         class PROCESSENTRY32W(ctypes.Structure):
             _fields_ = [
                 ("dwSize", ctypes.c_uint32),
@@ -271,6 +308,48 @@ class WindowsApiProbe:
         finally:
             self._close(snapshot)
         return processes
+
+    def enrich_signature(self, process: ProcessInfo) -> ProcessInfo:
+        if not process.path:
+            return process
+        status, subject = self._signature_for_path(process.path)
+        return replace(process, signer_status=status, signer_subject=subject)
+
+    def _signature_for_path(self, path: str) -> tuple[str, str]:
+        normalized = path.lower()
+        if normalized in self._signature_cache:
+            return self._signature_cache[normalized]
+        if not os.path.exists(path):
+            result = ("MISSING", "")
+            self._signature_cache[normalized] = result
+            return result
+
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$s = Get-AuthenticodeSignature -LiteralPath $args[0]; "
+            "($s.Status.ToString() + '|' + ($s.SignerCertificate.Subject -replace '\\r|\\n',' '))",
+            path,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+            output = (completed.stdout or "").strip().splitlines()[-1] if completed.stdout.strip() else ""
+            status, _, subject = output.partition("|")
+            result = ((status or "UNKNOWN").upper(), subject.strip())
+        except (OSError, subprocess.SubprocessError):
+            result = ("UNKNOWN", "")
+        self._signature_cache[normalized] = result
+        return result
 
     def iter_threads(self) -> list[ThreadInfo]:
         class THREADENTRY32(ctypes.Structure):
@@ -462,6 +541,39 @@ class BehaviorRuleEngine:
         "\\programdata\\",
         "\\temp\\",
     )
+    USER_INITIATED_PARENTS = {
+        "explorer.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "windowsterminal.exe",
+        "conhost.exe",
+        "wt.exe",
+    }
+    BACKGROUND_OR_AUTOMATION_PARENTS = {
+        "services.exe",
+        "svchost.exe",
+        "taskeng.exe",
+        "taskhostw.exe",
+        "wmiprvse.exe",
+        "wscript.exe",
+        "cscript.exe",
+        "mshta.exe",
+        "rundll32.exe",
+        "regsvr32.exe",
+    }
+    COMMANDLINE_PATTERNS = (
+        (re.compile(r"(?i)(?:^|\s)-(?:enc|encodedcommand)\b"), "encoded PowerShell command"),
+        (re.compile(r"(?i)\b(?:iex|invoke-expression)\b"), "Invoke-Expression execution"),
+        (re.compile(r"(?i)\bdownloadstring\b|\binvoke-webrequest\b|\biwr\b|\bcurl\s+https?://"), "scripted network download"),
+        (re.compile(r"(?i)\bfrombase64string\b"), "base64 decoding"),
+        (re.compile(r"(?i)(?:^|\s)-(?:w\s+hidden|windowstyle\s+hidden)\b"), "hidden script window"),
+        (re.compile(r"(?i)(?:^|\s)-executionpolicy\s+bypass\b"), "PowerShell execution policy bypass"),
+    )
+    TRUSTED_UPDATER_PARENTS = {
+        "code.exe",
+        "code - insiders.exe",
+    }
 
     def process_start_events(self, process: ProcessInfo, parent: ProcessInfo | None) -> list[MonitorEvent]:
         events: list[MonitorEvent] = []
@@ -504,6 +616,110 @@ class BehaviorRuleEngine:
                     20,
                     parent=parent,
                     evidence={"path": process.path},
+                )
+            )
+
+        if name in self.SCRIPT_OR_LOLBIN_NAMES and self._command_references_user_writable_path(process.command_line):
+            events.append(
+                self._event(
+                    "MEDIUM",
+                    "user_writable_script_argument",
+                    process,
+                    f"{process.name} references a script or payload from a user-writable path",
+                    25,
+                    parent=parent,
+                    evidence={"command_line": self._redact_command_line(process.command_line)},
+                )
+            )
+
+        command_findings = self._suspicious_command_line_findings(process.command_line)
+        if command_findings:
+            events.append(
+                self._event(
+                    "HIGH",
+                    "suspicious_command_line",
+                    process,
+                    f"{process.name} started with suspicious command-line content",
+                    35,
+                    parent=parent,
+                    evidence={
+                        "command_line": self._redact_command_line(process.command_line),
+                        "findings": ", ".join(command_findings),
+                    },
+                )
+            )
+
+        if parent_name in self.BACKGROUND_OR_AUTOMATION_PARENTS and name in self.SCRIPT_OR_LOLBIN_NAMES:
+            events.append(
+                self._event(
+                    "MEDIUM",
+                    "background_lolbin_launch",
+                    process,
+                    f"{parent_name} launched {name}; background LOLBin launches deserve review",
+                    25,
+                    parent=parent,
+                    evidence={"parent_name": parent.name if parent else ""},
+                )
+            )
+
+        if parent_name and parent_name not in self.USER_INITIATED_PARENTS and name in self.SCRIPT_OR_LOLBIN_NAMES:
+            events.append(
+                self._event(
+                    "LOW",
+                    "non_interactive_parent",
+                    process,
+                    f"{process.name} was not launched by a common interactive shell parent",
+                    10,
+                    parent=parent,
+                    evidence={"parent_name": parent.name if parent else ""},
+                )
+            )
+
+        reputation_events = self.reputation_events(process, parent)
+        events.extend(reputation_events)
+
+        return events
+
+    def reputation_events(self, process: ProcessInfo, parent: ProcessInfo | None = None) -> list[MonitorEvent]:
+        events: list[MonitorEvent] = []
+        path = process.path.lower()
+        signer_status = process.signer_status.upper()
+        user_writable = self._is_user_writable_path(path)
+
+        if self._is_known_trusted_updater(process, parent):
+            return []
+
+        if process.path and user_writable and signer_status not in {"VALID", "UNKNOWN"}:
+            events.append(
+                self._event(
+                    "HIGH",
+                    "unsigned_user_writable_process",
+                    process,
+                    f"{process.name} is unsigned or untrusted and running from a user-writable path",
+                    35,
+                    parent=parent,
+                    evidence={
+                        "path": process.path,
+                        "signer_status": process.signer_status,
+                        "signer_subject": process.signer_subject,
+                    },
+                )
+            )
+
+        if signer_status not in {"VALID", "UNKNOWN"} and path and not self._is_windows_system_path(path):
+            events.append(
+                self._event(
+                    "MEDIUM",
+                    "untrusted_process_signature",
+                    process,
+                    f"{process.name} has an untrusted or missing Authenticode signature",
+                    20,
+                    parent=parent,
+                    evidence={
+                        "path": process.path,
+                        "signer_status": process.signer_status,
+                        "signer_subject": process.signer_subject,
+                    },
                 )
             )
 
@@ -571,6 +787,48 @@ class BehaviorRuleEngine:
     @staticmethod
     def _is_user_writable_path(path: str) -> bool:
         return any(marker in path for marker in BehaviorRuleEngine.USER_WRITABLE_MARKERS)
+
+    @classmethod
+    def _command_references_user_writable_path(cls, command_line: str) -> bool:
+        return cls._is_user_writable_path(command_line.lower())
+
+    @classmethod
+    def _is_known_trusted_updater(cls, process: ProcessInfo, parent: ProcessInfo | None) -> bool:
+        name = process.name.lower()
+        path = process.path.lower()
+        parent_name = (parent.name if parent else "").lower()
+
+        if parent_name in cls.TRUSTED_UPDATER_PARENTS:
+            return name.startswith("codesetup-") and "\\temp\\vscode-" in path
+
+        if parent_name.startswith("codesetup-"):
+            return name.startswith("codesetup-") and "\\temp\\is-" in path
+
+        return False
+
+    @staticmethod
+    def _is_windows_system_path(path: str) -> bool:
+        return "\\windows\\system32\\" in path or "\\windows\\syswow64\\" in path
+
+    @classmethod
+    def _suspicious_command_line_findings(cls, command_line: str) -> list[str]:
+        if not command_line:
+            return []
+        findings = [description for pattern, description in cls.COMMANDLINE_PATTERNS if pattern.search(command_line)]
+        try:
+            parts = shlex.split(command_line, posix=False)
+        except ValueError:
+            parts = command_line.split()
+        long_tokens = [part for part in parts if len(part) >= 120 and re.fullmatch(r"[A-Za-z0-9+/=]+", part)]
+        if long_tokens:
+            findings.append("long base64-like token")
+        return findings
+
+    @staticmethod
+    def _redact_command_line(command_line: str) -> str:
+        if len(command_line) <= 500:
+            return command_line
+        return command_line[:500] + "...<truncated>"
 
     @staticmethod
     def _hex(value: int | None) -> str:
@@ -658,8 +916,10 @@ class WindowsBehaviorMonitor:
                 for pid in sorted(new_pids):
                     if self._is_own_process(pid, processes):
                         continue
-                    process = processes[pid]
+                    process = self._with_signature(processes[pid])
                     parent = processes.get(process.parent_pid) or baseline_processes.get(process.parent_pid)
+                    parent = self._with_signature(parent) if parent else None
+                    processes[pid] = process
                     events.extend(self.rule_engine.process_start_events(process, parent))
 
             if self.config.inspect_thread_starts:
@@ -760,6 +1020,11 @@ class WindowsBehaviorMonitor:
 
     def _process_map(self) -> dict[int, ProcessInfo]:
         return {process.pid: process for process in self.probe.iter_processes()}
+
+    def _with_signature(self, process: ProcessInfo) -> ProcessInfo:
+        if not self.probe or process.signer_status != "UNKNOWN":
+            return process
+        return self.probe.enrich_signature(process)
 
     def _memory_scan_candidates(self, processes: dict[int, ProcessInfo], new_pids: Iterable[int]) -> list[ProcessInfo]:
         new_pid_set = set(new_pids)

@@ -1,9 +1,9 @@
 # Live Monitor Test Tools
 
-These scripts create benign behavior that should trigger the Windows live monitor.
-They are for local validation only and do not execute a payload.
+These scripts create controlled local behavior for validating the Windows live
+monitor. They do not execute a malicious payload.
 
-## Private Executable Thread Start
+## Process Origin And Command-Line Rules
 
 1. Start the Streamlit app:
 
@@ -18,6 +18,49 @@ python -m streamlit run app.py
 4. Click `Start live monitoring session`.
 
 5. In a second PowerShell window, run:
+
+```powershell
+python .\live_monitor_test_tools\simulate_process_origin.py all
+```
+
+Expected monitor behavior:
+
+```text
+benign-user:
+  notepad.exe should usually produce no high-risk event.
+
+encoded-powershell:
+  category: suspicious_command_line
+  evidence: encoded PowerShell command, hidden script window
+
+downloads-script:
+  category: user_writable_script_argument
+  evidence: command line references Downloads\live_monitor_probe.ps1
+
+scheduled-task:
+  category: suspicious_command_line
+  optional category: background_lolbin_launch
+  evidence: PowerShell launched through Windows Task Scheduler
+```
+
+You can also run one scenario at a time:
+
+```powershell
+python .\live_monitor_test_tools\simulate_process_origin.py benign-user
+python .\live_monitor_test_tools\simulate_process_origin.py encoded-powershell
+python .\live_monitor_test_tools\simulate_process_origin.py downloads-script
+python .\live_monitor_test_tools\simulate_process_origin.py scheduled-task
+```
+
+The `scheduled-task` scenario is the closest safe local approximation for a
+background/service-style launch. A normal Python test cannot create a true
+kernel-origin process; Windows process creation is still represented in user
+mode by a parent process such as Task Scheduler, Service Control Manager, WMI,
+or a driver-backed service.
+
+## Private Executable Thread Start
+
+Run this while a live monitoring session is active:
 
 ```powershell
 python .\live_monitor_test_tools\simulate_private_exec_thread.py
