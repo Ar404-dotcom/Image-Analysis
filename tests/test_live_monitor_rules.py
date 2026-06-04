@@ -26,10 +26,10 @@ class LiveMonitorRuleTests(unittest.TestCase):
         child = ProcessInfo(pid=101, parent_pid=100, name="powershell.exe", path=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 
         events = self.rules.process_start_events(child, parent)
+        chain_events = [event for event in events if event.category == "suspicious_process_tree"]
 
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].severity, "HIGH")
-        self.assertEqual(events[0].category, "suspicious_process_tree")
+        self.assertEqual(len(chain_events), 1)
+        self.assertEqual(chain_events[0].severity, "HIGH")
 
     def test_suspicious_command_line_flags_encoded_powershell(self):
         parent = ProcessInfo(pid=100, parent_pid=4, name="explorer.exe", path=r"C:\Windows\explorer.exe")
@@ -178,6 +178,36 @@ class LiveMonitorRuleTests(unittest.TestCase):
         self.assertEqual(self.rules.memory_region_events(ordinary, region), [])
         self.assertEqual(self.rules.memory_region_events(browser, region), [])
 
+    def test_executable_to_noaccess_transition_flags_sleep_obfuscation(self):
+        owner = ProcessInfo(pid=500, parent_pid=4, name="lsass.exe", path=r"C:\Windows\System32\lsass.exe")
+        watched = self._watched_region(previous_protection=0x40)
+        current = MemoryRegion(
+            base_address=0x200000,
+            size=8192,
+            protection=WindowsApiProbe.PAGE_NOACCESS,
+            region_type=WindowsApiProbe.MEM_PRIVATE,
+            state=WindowsApiProbe.MEM_COMMIT,
+        )
+
+        events = self.rules.page_transition_events(owner, watched, current)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].severity, "CRITICAL")
+        self.assertEqual(events[0].category, "sleep_obfuscation_page_transition")
+
+    def test_non_executable_transition_does_not_trigger_sleep_obfuscation(self):
+        owner = ProcessInfo(pid=500, parent_pid=4, name="lsass.exe", path=r"C:\Windows\System32\lsass.exe")
+        watched = self._watched_region(previous_protection=0x04)
+        current = MemoryRegion(
+            base_address=0x200000,
+            size=8192,
+            protection=WindowsApiProbe.PAGE_NOACCESS,
+            region_type=WindowsApiProbe.MEM_PRIVATE,
+            state=WindowsApiProbe.MEM_COMMIT,
+        )
+
+        self.assertEqual(self.rules.page_transition_events(owner, watched, current), [])
+
     def test_jit_heavy_browsers_are_not_memory_scanned_for_region_only_alerts(self):
         browser = ProcessInfo(pid=20, parent_pid=4, name="chrome.exe", path=r"C:\Program Files\Chrome\chrome.exe")
 
@@ -190,7 +220,23 @@ class LiveMonitorRuleTests(unittest.TestCase):
         self.assertTrue(report["self_test"])
         self.assertIn("suspicious_process_tree", categories)
         self.assertIn("private_executable_thread_start", categories)
+        self.assertIn("sleep_obfuscation_page_transition", categories)
         self.assertGreater(report["summary"]["risk_score"], 0)
+
+    @staticmethod
+    def _watched_region(previous_protection: int):
+        from live_monitor.windows_monitor import WatchedRegion
+
+        return WatchedRegion(
+            pid=500,
+            base_address=0x200000,
+            size=8192,
+            previous_protection=previous_protection,
+            first_seen=0.0,
+            last_seen=0.0,
+            source="unit test",
+            thread_id=123,
+        )
 
 
 if __name__ == "__main__":

@@ -77,3 +77,37 @@ message: Thread <id> starts in private executable memory
 The simulator allocates one `PAGE_EXECUTE_READWRITE` memory page, writes a single
 `RET` instruction, starts a thread at that address, then keeps the process alive
 briefly so the monitor has time to observe it.
+
+## Sleep-Obfuscation Page Transition
+
+1. Start the Streamlit app:
+
+```powershell
+python -m streamlit run app.py
+```
+
+2. Open `Live Monitoring`.
+
+3. Enable `Detect sleep-obfuscation page transitions`.
+
+4. Use a session duration of at least `30` seconds.
+
+5. Click `Start live monitoring session`.
+
+6. In a second PowerShell window, run:
+
+```powershell
+python .\live_monitor_test_tools\simulate_sleep_obfuscation_transition.py
+```
+
+Expected monitor event:
+
+```text
+severity: CRITICAL
+category: sleep_obfuscation_page_transition
+message: <process> changed watched executable memory to NOACCESS
+```
+
+The simulator allocates one executable page, starts a harmless `RET` thread from
+that page, waits briefly, changes the page to `PAGE_NOACCESS`, then restores it.
+This validates the dormant/sleep-obfuscation detector without running malware.

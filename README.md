@@ -29,6 +29,7 @@ This project now includes both:
 - Watch process starts, suspicious parent-child chains, and process masquerading
 - Inspect new thread start addresses for private executable-memory starts
 - Track newly observed private executable-memory regions in sensitive processes
+- Watch suspicious executable regions for sleep-obfuscation style page-protection flips
 - Export monitoring reports as JSON
 
 ## Setup

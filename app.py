@@ -535,7 +535,7 @@ def render_scan_result(result: dict | None, console_output: str, report_name: st
 
 def render_live_monitoring_tab() -> None:
     st.markdown("### Live Monitoring")
-    st.caption("Run a bounded Windows behavior-monitoring session for process, thread, and private executable-memory signals.")
+    st.caption("Run a bounded Windows behavior-monitoring session for process, thread, private executable-memory, and page-transition signals.")
 
     is_windows = platform.system() == "Windows"
     if not is_windows:
@@ -550,6 +550,7 @@ def render_live_monitoring_tab() -> None:
     with right:
         inspect_threads = st.checkbox("Inspect new thread start addresses", value=True)
         inspect_memory = st.checkbox("Inspect private executable memory", value=True)
+        inspect_transitions = st.checkbox("Detect sleep-obfuscation page transitions", value=True)
         include_process_starts = st.checkbox("Evaluate new process starts", value=True)
 
     st.markdown(
@@ -557,7 +558,8 @@ def render_live_monitoring_tab() -> None:
         <div class="panel">
             The monitor runs in user mode and focuses on behavior: suspicious process chains,
             thread starts inside private executable memory, process masquerading, and newly
-            observed executable private regions in sensitive processes.
+            observed executable private regions in sensitive processes. Page-transition tracking
+            watches those regions for sleep-obfuscation style flips to non-executable protections.
         </div>
         """,
         unsafe_allow_html=True,
@@ -575,6 +577,8 @@ def render_live_monitoring_tab() -> None:
             interval_seconds=float(interval),
             inspect_thread_starts=inspect_threads,
             inspect_memory_regions=inspect_memory,
+            inspect_page_transitions=inspect_transitions,
+            transition_watch_seconds=max(10, int(duration)),
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
         )
@@ -595,6 +599,8 @@ def render_live_monitoring_tab() -> None:
             interval_seconds=float(interval),
             inspect_thread_starts=inspect_threads,
             inspect_memory_regions=inspect_memory,
+            inspect_page_transitions=inspect_transitions,
+            transition_watch_seconds=max(10, int(duration)),
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
         )

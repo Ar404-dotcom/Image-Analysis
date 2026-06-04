@@ -55,6 +55,19 @@ class ThreadInfo:
 
 
 @dataclass
+class WatchedRegion:
+    pid: int
+    base_address: int
+    size: int
+    previous_protection: int
+    first_seen: float
+    last_seen: float
+    source: str
+    thread_id: int | None = None
+    alerted: bool = False
+
+
+@dataclass
 class MonitorEvent:
     timestamp: str
     severity: str
@@ -92,6 +105,8 @@ class MonitorConfig:
     interval_seconds: float = 1.0
     inspect_thread_starts: bool = True
     inspect_memory_regions: bool = True
+    inspect_page_transitions: bool = True
+    transition_watch_seconds: int = 30
     max_processes_per_cycle: int = 80
     max_regions_per_process: int = 2048
     max_events: int = 500
@@ -451,6 +466,15 @@ class WindowsApiProbe:
             state=int(mbi.State),
         )
 
+    def query_process_region(self, pid: int, address: int) -> MemoryRegion | None:
+        handle = self.open_process(pid)
+        if not handle:
+            return None
+        try:
+            return self.query_region(handle, address)
+        finally:
+            self._close(handle)
+
     def private_executable_regions(self, pid: int, max_regions: int) -> list[MemoryRegion]:
         handle = self.open_process(pid)
         if not handle:
@@ -777,12 +801,54 @@ class BehaviorRuleEngine:
             ]
         return []
 
+    def page_transition_events(
+        self,
+        process: ProcessInfo,
+        watched: WatchedRegion,
+        current_region: MemoryRegion,
+    ) -> list[MonitorEvent]:
+        if watched.alerted:
+            return []
+        if not self._is_sleep_obfuscation_transition(watched.previous_protection, current_region.protection):
+            return []
+
+        return [
+            self._event(
+                "CRITICAL",
+                "sleep_obfuscation_page_transition",
+                process,
+                f"{process.name} changed watched executable memory to {WindowsApiProbe.protection_name(current_region.protection)}",
+                70,
+                thread_id=watched.thread_id,
+                evidence={
+                    "source": watched.source,
+                    "region_base": self._hex(current_region.base_address),
+                    "region_size": current_region.size,
+                    "previous_protection": WindowsApiProbe.protection_name(watched.previous_protection),
+                    "current_protection": WindowsApiProbe.protection_name(current_region.protection),
+                    "region_type": WindowsApiProbe.region_type_name(current_region.region_type),
+                    "age_seconds": round(time.monotonic() - watched.first_seen, 3),
+                },
+            )
+        ]
+
     @classmethod
     def should_memory_scan(cls, process: ProcessInfo, is_new_process: bool) -> bool:
         process_name = process.name.lower()
         if process_name in cls.JIT_HEAVY_PROCESSES:
             return False
         return is_new_process or process_name in cls.SENSITIVE_TARGETS
+
+    @staticmethod
+    def _is_sleep_obfuscation_transition(previous_protection: int, current_protection: int) -> bool:
+        if not WindowsApiProbe.is_executable_protection(previous_protection):
+            return False
+        current_base = current_protection & 0xFF
+        return current_base in {
+            WindowsApiProbe.PAGE_NOACCESS,
+            0x04,  # PAGE_READWRITE
+            0x08,  # PAGE_WRITECOPY
+        }
 
     @staticmethod
     def _is_user_writable_path(path: str) -> bool:
@@ -893,6 +959,7 @@ class WindowsBehaviorMonitor:
         seen_pids = set(baseline_processes)
         seen_threads = {thread.tid for thread in self.probe.iter_threads()}
         seen_regions: dict[int, set[tuple[int, int, int]]] = {}
+        watched_regions: dict[tuple[int, int], WatchedRegion] = {}
 
         if self.config.inspect_memory_regions:
             for process in self._memory_scan_candidates(baseline_processes, set()):
@@ -934,6 +1001,14 @@ class WindowsBehaviorMonitor:
                         continue
                     enriched = self.probe.thread_start_info(thread)
                     events.extend(self.rule_engine.thread_start_events(enriched, processes.get(thread.owner_pid)))
+                    if self.config.inspect_page_transitions and enriched.start_region:
+                        self._watch_region(
+                            watched_regions,
+                            process=processes[thread.owner_pid],
+                            region=enriched.start_region,
+                            source="private executable thread start",
+                            thread_id=enriched.tid,
+                        )
 
             if self.config.inspect_memory_regions:
                 for process in self._memory_scan_candidates(processes, new_pids):
@@ -948,6 +1023,16 @@ class WindowsBehaviorMonitor:
                             continue
                         known.add(region.key)
                         events.extend(self.rule_engine.memory_region_events(process, region))
+                        if self.config.inspect_page_transitions:
+                            self._watch_region(
+                                watched_regions,
+                                process=process,
+                                region=region,
+                                source="private executable memory",
+                            )
+
+            if self.config.inspect_page_transitions:
+                events.extend(self._page_transition_events(watched_regions, processes))
 
             if len(events) > self.config.max_events:
                 events = events[-self.config.max_events:]
@@ -968,6 +1053,77 @@ class WindowsBehaviorMonitor:
             "configuration": self._configuration_dict(),
             "message": "Monitoring session completed.",
         }
+
+    def _watch_region(
+        self,
+        watched_regions: dict[tuple[int, int], WatchedRegion],
+        process: ProcessInfo,
+        region: MemoryRegion,
+        source: str,
+        thread_id: int | None = None,
+    ) -> None:
+        if not WindowsApiProbe.is_executable_protection(region.protection):
+            return
+        if region.region_type != WindowsApiProbe.MEM_PRIVATE:
+            return
+        if process.name.lower() in BehaviorRuleEngine.JIT_HEAVY_PROCESSES:
+            return
+
+        key = (process.pid, region.base_address)
+        now = time.monotonic()
+        existing = watched_regions.get(key)
+        if existing:
+            existing.previous_protection = region.protection
+            existing.last_seen = now
+            if thread_id is not None:
+                existing.thread_id = thread_id
+            return
+
+        watched_regions[key] = WatchedRegion(
+            pid=process.pid,
+            base_address=region.base_address,
+            size=region.size,
+            previous_protection=region.protection,
+            first_seen=now,
+            last_seen=now,
+            source=source,
+            thread_id=thread_id,
+        )
+
+    def _page_transition_events(
+        self,
+        watched_regions: dict[tuple[int, int], WatchedRegion],
+        processes: dict[int, ProcessInfo],
+    ) -> list[MonitorEvent]:
+        events: list[MonitorEvent] = []
+        now = time.monotonic()
+
+        for key, watched in list(watched_regions.items()):
+            if now - watched.first_seen > self.config.transition_watch_seconds:
+                watched_regions.pop(key, None)
+                continue
+
+            process = processes.get(watched.pid)
+            if process is None:
+                watched_regions.pop(key, None)
+                continue
+
+            current_region = self.probe.query_process_region(watched.pid, watched.base_address)
+            if current_region is None:
+                watched_regions.pop(key, None)
+                continue
+
+            transition_events = self.rule_engine.page_transition_events(process, watched, current_region)
+            if transition_events:
+                watched.alerted = True
+                events.extend(transition_events)
+                continue
+
+            if WindowsApiProbe.is_executable_protection(current_region.protection):
+                watched.previous_protection = current_region.protection
+            watched.last_seen = now
+
+        return events
 
     def self_test_report(self) -> dict:
         """Return a synthetic report proving the behavior rules can fire."""
@@ -996,16 +1152,34 @@ class WindowsBehaviorMonitor:
             region_type=WindowsApiProbe.MEM_PRIVATE,
             state=WindowsApiProbe.MEM_COMMIT,
         )
+        hidden_region = MemoryRegion(
+            base_address=0x100000,
+            size=4096,
+            protection=WindowsApiProbe.PAGE_NOACCESS,
+            region_type=WindowsApiProbe.MEM_PRIVATE,
+            state=WindowsApiProbe.MEM_COMMIT,
+        )
         thread = ThreadInfo(
             tid=900,
             owner_pid=owner.pid,
             start_address=0x100100,
             start_region=region,
         )
+        watched = WatchedRegion(
+            pid=owner.pid,
+            base_address=region.base_address,
+            size=region.size,
+            previous_protection=region.protection,
+            first_seen=time.monotonic(),
+            last_seen=time.monotonic(),
+            source="self-test private executable thread start",
+            thread_id=thread.tid,
+        )
 
         events = []
         events.extend(self.rule_engine.process_start_events(child, parent))
         events.extend(self.rule_engine.thread_start_events(thread, owner))
+        events.extend(self.rule_engine.page_transition_events(owner, watched, hidden_region))
 
         return {
             "supported": True,
@@ -1064,6 +1238,8 @@ class WindowsBehaviorMonitor:
             "interval_seconds": self.config.interval_seconds,
             "inspect_thread_starts": self.config.inspect_thread_starts,
             "inspect_memory_regions": self.config.inspect_memory_regions,
+            "inspect_page_transitions": self.config.inspect_page_transitions,
+            "transition_watch_seconds": self.config.transition_watch_seconds,
             "max_processes_per_cycle": self.config.max_processes_per_cycle,
             "max_regions_per_process": self.config.max_regions_per_process,
             "include_process_starts": self.config.include_process_starts,
