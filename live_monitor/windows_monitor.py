@@ -106,6 +106,59 @@ class NetworkPortInfo:
         }
 
 
+@dataclass(frozen=True)
+class ProcessMemorySample:
+    pid: int
+    rss_bytes: int
+    memory_percent: float
+    status: str
+
+    @property
+    def rss_mb(self) -> float:
+        return round(self.rss_bytes / (1024 * 1024), 2)
+
+
+@dataclass
+class MemorySurgeRecord:
+    pid: int
+    process_name: str
+    process_path: str
+    first_seen: str
+    last_seen: str
+    baseline_rss_bytes: int
+    peak_rss_bytes: int
+    latest_rss_bytes: int
+    peak_growth_percent: float
+    latest_growth_percent: float
+    peak_memory_percent: float
+    latest_memory_percent: float
+    status: str
+    persistence_cycles: int = 0
+    sleeping_after_surge: bool = False
+    alive: bool = True
+    sleep_event_emitted: bool = False
+
+    def as_dict(self) -> dict:
+        return {
+            "pid": self.pid,
+            "process_name": self.process_name,
+            "process_path": self.process_path,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "baseline_rss_mb": round(self.baseline_rss_bytes / (1024 * 1024), 2),
+            "peak_rss_mb": round(self.peak_rss_bytes / (1024 * 1024), 2),
+            "latest_rss_mb": round(self.latest_rss_bytes / (1024 * 1024), 2),
+            "peak_growth_percent": round(self.peak_growth_percent, 2),
+            "latest_growth_percent": round(self.latest_growth_percent, 2),
+            "peak_memory_percent": round(self.peak_memory_percent, 3),
+            "latest_memory_percent": round(self.latest_memory_percent, 3),
+            "status": self.status,
+            "persistence_cycles": self.persistence_cycles,
+            "sleeping_after_surge": self.sleeping_after_surge,
+            "alive": self.alive,
+        }
+
+
 @dataclass
 class WatchedRegion:
     pid: int
@@ -165,6 +218,10 @@ class MonitorConfig:
     include_process_starts: bool = True
     inspect_network_ports: bool = True
     max_network_connections: int = 500
+    inspect_memory_growth: bool = True
+    memory_growth_percent_threshold: float = 35.0
+    memory_growth_min_mb: int = 8
+    memory_persistence_cycles: int = 2
 
 
 def utc_now() -> str:
@@ -712,6 +769,13 @@ class BehaviorRuleEngine:
         "code.exe",
         "code - insiders.exe",
     }
+    SLEEP_LIKE_STATUSES = {
+        "sleeping",
+        "disk-sleep",
+        "stopped",
+        "parked",
+        "idle",
+    }
 
     def process_start_events(self, process: ProcessInfo, parent: ProcessInfo | None) -> list[MonitorEvent]:
         events: list[MonitorEvent] = []
@@ -935,6 +999,68 @@ class BehaviorRuleEngine:
 
         return events
 
+    def memory_growth_events(
+        self,
+        process: ProcessInfo,
+        previous: ProcessMemorySample,
+        current: ProcessMemorySample,
+    ) -> list[MonitorEvent]:
+        growth_percent = ((current.rss_bytes - previous.rss_bytes) / max(previous.rss_bytes, 1)) * 100
+        delta_mb = (current.rss_bytes - previous.rss_bytes) / (1024 * 1024)
+        severity = "HIGH" if growth_percent >= 200 or current.memory_percent >= 5.0 else "MEDIUM"
+        score = 45 if severity == "HIGH" else 30
+        return [
+            self._event(
+                severity,
+                "sudden_memory_growth",
+                process,
+                f"{process.name} increased memory by {growth_percent:.1f}% in one interval",
+                score,
+                evidence={
+                    "previous_rss_mb": round(previous.rss_mb, 2),
+                    "current_rss_mb": round(current.rss_mb, 2),
+                    "delta_mb": round(delta_mb, 2),
+                    "growth_percent": round(growth_percent, 2),
+                    "memory_percent": round(current.memory_percent, 3),
+                    "status": current.status,
+                },
+            )
+        ]
+
+    def memory_surge_sleep_events(
+        self,
+        process: ProcessInfo,
+        record: MemorySurgeRecord,
+    ) -> list[MonitorEvent]:
+        if not self._is_sleep_like_status(record.status):
+            return []
+        return [
+            self._event(
+                "MEDIUM",
+                "memory_surge_then_sleep",
+                process,
+                f"{process.name} stayed alive after a sharp memory increase and moved into a sleep-like state",
+                25,
+                evidence={
+                    "peak_growth_percent": round(record.peak_growth_percent, 2),
+                    "peak_rss_mb": round(record.peak_rss_bytes / (1024 * 1024), 2),
+                    "latest_rss_mb": round(record.latest_rss_bytes / (1024 * 1024), 2),
+                    "memory_percent": round(record.latest_memory_percent, 3),
+                    "status": record.status,
+                    "persistence_cycles": record.persistence_cycles,
+                },
+            )
+        ]
+
+    @classmethod
+    def should_track_memory_growth(cls, process: ProcessInfo) -> bool:
+        process_name = process.name.lower()
+        if process_name in cls.JIT_HEAVY_PROCESSES:
+            return False
+        if process.signer_status.upper() == "VALID" and not cls._is_user_writable_path(process.path.lower()):
+            return False
+        return True
+
     def thread_start_events(self, thread: ThreadInfo, owner: ProcessInfo | None) -> list[MonitorEvent]:
         if not owner or not thread.start_region:
             return []
@@ -1082,6 +1208,10 @@ class BehaviorRuleEngine:
             return command_line
         return command_line[:500] + "...<truncated>"
 
+    @classmethod
+    def _is_sleep_like_status(cls, status: str) -> bool:
+        return status.lower() in cls.SLEEP_LIKE_STATUSES
+
     @staticmethod
     def _hex(value: int | None) -> str:
         return f"0x{value:x}" if value is not None else ""
@@ -1148,10 +1278,14 @@ class WindowsBehaviorMonitor:
         watched_regions: dict[tuple[int, int], WatchedRegion] = {}
         network_ports: list[NetworkPortInfo] = []
         seen_network_ports: set[tuple[str, str, int, str, int, str, int]] = set()
+        previous_memory_samples: dict[int, ProcessMemorySample] = {}
+        memory_surges: dict[int, MemorySurgeRecord] = {}
 
         if self.config.inspect_network_ports:
             network_ports = self.collect_live_ports(baseline_processes)
             seen_network_ports = {port.key for port in network_ports}
+        if self.config.inspect_memory_growth:
+            previous_memory_samples = self.collect_process_memory_samples(baseline_processes)
 
         if self.config.inspect_memory_regions:
             for process in self._memory_scan_candidates(baseline_processes, set()):
@@ -1170,6 +1304,18 @@ class WindowsBehaviorMonitor:
 
             processes = self._process_map()
             new_pids = set(processes) - seen_pids
+
+            if self.config.inspect_memory_growth:
+                current_memory_samples = self.collect_process_memory_samples(processes)
+                events.extend(
+                    self._memory_growth_cycle_events(
+                        processes,
+                        previous_memory_samples,
+                        current_memory_samples,
+                        memory_surges,
+                    )
+                )
+                previous_memory_samples = current_memory_samples
 
             if self.config.inspect_network_ports:
                 network_ports = self.collect_live_ports(processes)
@@ -1253,6 +1399,8 @@ class WindowsBehaviorMonitor:
             "configuration": self._configuration_dict(),
             "network_ports": [port.as_dict() for port in network_ports],
             "network_summary": self._network_summary(network_ports),
+            "memory_surges": self._memory_surge_rows(memory_surges),
+            "memory_surge_summary": self._memory_surge_summary(memory_surges),
             "message": "Monitoring session completed.",
         }
 
@@ -1508,6 +1656,26 @@ class WindowsBehaviorMonitor:
         )
         return ports
 
+    def collect_process_memory_samples(self, processes: dict[int, ProcessInfo]) -> dict[int, ProcessMemorySample]:
+        if psutil is None:
+            return {}
+        samples: dict[int, ProcessMemorySample] = {}
+        for pid in processes:
+            if self._is_own_process(pid, processes):
+                continue
+            try:
+                process = psutil.Process(pid)
+                info = process.memory_info()
+                samples[pid] = ProcessMemorySample(
+                    pid=pid,
+                    rss_bytes=int(info.rss),
+                    memory_percent=float(process.memory_percent() or 0.0),
+                    status=process.status() or "unknown",
+                )
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+                continue
+        return samples
+
     def _process_map(self) -> dict[int, ProcessInfo]:
         if not self.probe:
             return {}
@@ -1533,6 +1701,86 @@ class WindowsBehaviorMonitor:
             return True
         process = processes.get(pid)
         return bool(process and process.parent_pid == self.current_pid)
+
+    def _memory_growth_cycle_events(
+        self,
+        processes: dict[int, ProcessInfo],
+        previous_samples: dict[int, ProcessMemorySample],
+        current_samples: dict[int, ProcessMemorySample],
+        memory_surges: dict[int, MemorySurgeRecord],
+    ) -> list[MonitorEvent]:
+        events: list[MonitorEvent] = []
+        threshold_bytes = int(self.config.memory_growth_min_mb * 1024 * 1024)
+
+        for pid, sample in current_samples.items():
+            previous = previous_samples.get(pid)
+            process = processes.get(pid)
+            if process is None or previous is None:
+                continue
+
+            delta_bytes = sample.rss_bytes - previous.rss_bytes
+            growth_percent = (delta_bytes / max(previous.rss_bytes, 1)) * 100 if previous.rss_bytes > 0 else 0.0
+            record = memory_surges.get(pid)
+
+            if delta_bytes >= threshold_bytes and growth_percent >= self.config.memory_growth_percent_threshold:
+                process = self._with_signature(process)
+                processes[pid] = process
+                if not self.rule_engine.should_track_memory_growth(process):
+                    continue
+                if record is None:
+                    record = MemorySurgeRecord(
+                        pid=pid,
+                        process_name=process.name,
+                        process_path=process.path,
+                        first_seen=utc_now(),
+                        last_seen=utc_now(),
+                        baseline_rss_bytes=previous.rss_bytes,
+                        peak_rss_bytes=sample.rss_bytes,
+                        latest_rss_bytes=sample.rss_bytes,
+                        peak_growth_percent=growth_percent,
+                        latest_growth_percent=growth_percent,
+                        peak_memory_percent=sample.memory_percent,
+                        latest_memory_percent=sample.memory_percent,
+                        status=sample.status,
+                    )
+                    memory_surges[pid] = record
+                    events.extend(self.rule_engine.memory_growth_events(process, previous, sample))
+                else:
+                    record.last_seen = utc_now()
+                    record.latest_rss_bytes = sample.rss_bytes
+                    record.latest_growth_percent = growth_percent
+                    record.latest_memory_percent = sample.memory_percent
+                    record.status = sample.status
+                    record.alive = True
+                    if growth_percent > record.peak_growth_percent:
+                        record.peak_growth_percent = growth_percent
+                        record.peak_rss_bytes = sample.rss_bytes
+                    if sample.memory_percent > record.peak_memory_percent:
+                        record.peak_memory_percent = sample.memory_percent
+
+            if record is not None:
+                record.last_seen = utc_now()
+                record.latest_rss_bytes = sample.rss_bytes
+                record.latest_growth_percent = max(growth_percent, 0.0)
+                record.latest_memory_percent = sample.memory_percent
+                record.status = sample.status
+                record.alive = True
+                record.persistence_cycles += 1
+                record.sleeping_after_surge = self.rule_engine._is_sleep_like_status(sample.status)
+                if (
+                    record.sleeping_after_surge
+                    and not record.sleep_event_emitted
+                    and record.persistence_cycles >= self.config.memory_persistence_cycles
+                ):
+                    events.extend(self.rule_engine.memory_surge_sleep_events(process, record))
+                    record.sleep_event_emitted = True
+
+        current_pids = set(current_samples)
+        for pid, record in memory_surges.items():
+            if pid not in current_pids:
+                record.alive = False
+
+        return events
 
     @staticmethod
     def _socket_address_parts(address) -> tuple[str, int]:
@@ -1578,6 +1826,22 @@ class WindowsBehaviorMonitor:
         }
 
     @staticmethod
+    def _memory_surge_rows(memory_surges: dict[int, MemorySurgeRecord]) -> list[dict]:
+        rows = [record.as_dict() for record in memory_surges.values()]
+        rows.sort(key=lambda row: (-row["peak_growth_percent"], -row["peak_rss_mb"], row["process_name"].lower(), row["pid"]))
+        return rows
+
+    @staticmethod
+    def _memory_surge_summary(memory_surges: dict[int, MemorySurgeRecord]) -> dict:
+        rows = WindowsBehaviorMonitor._memory_surge_rows(memory_surges)
+        return {
+            "tracked_processes": len(rows),
+            "sleeping_after_surge": sum(1 for row in rows if row["sleeping_after_surge"]),
+            "alive_after_surge": sum(1 for row in rows if row["alive"]),
+            "max_growth_percent": round(max((row["peak_growth_percent"] for row in rows), default=0.0), 2),
+        }
+
+    @staticmethod
     def _network_summary(ports: list[NetworkPortInfo]) -> dict:
         public_connections = [
             port
@@ -1619,4 +1883,8 @@ class WindowsBehaviorMonitor:
             "include_process_starts": self.config.include_process_starts,
             "inspect_network_ports": self.config.inspect_network_ports,
             "max_network_connections": self.config.max_network_connections,
+            "inspect_memory_growth": self.config.inspect_memory_growth,
+            "memory_growth_percent_threshold": self.config.memory_growth_percent_threshold,
+            "memory_growth_min_mb": self.config.memory_growth_min_mb,
+            "memory_persistence_cycles": self.config.memory_persistence_cycles,
         }

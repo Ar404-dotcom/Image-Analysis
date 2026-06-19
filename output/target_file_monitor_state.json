@@ -1,0 +1,12 @@
+{
+  "armed": false,
+  "detected": false,
+  "detection_method": "ReadDirectoryChangesW",
+  "detection_message": "Target-file monitor is idle.",
+  "memory_surge_detected": false,
+  "memory_detection_method": "psutil memory sampling",
+  "memory_detection_message": "Target-file memory monitor is idle.",
+  "memory_surge": {},
+  "original_path": "C:\\Users\\HP\\Downloads\\Resume updated June.pdf",
+  "locked_path": "C:\\Users\\HP\\Downloads\\Resume updated June_LOCKED.pdf"
+}

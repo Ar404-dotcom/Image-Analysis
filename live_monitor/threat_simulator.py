@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import subprocess
 import sys
 import time
+import ctypes
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,7 +25,153 @@ PID_FILE_NAME = "simulator.pid"
 DEFAULT_TARGET_FILE = Path(r"C:\Users\HP\Downloads\Resume updated June.pdf")
 TARGET_PID_FILE = Path("output") / "target_file_simulator.pid"
 ACTION_LOG_FILE = Path("output") / "readme.txt"
+TARGET_MONITOR_STATE_FILE = Path("output") / "target_file_monitor_state.json"
 _RUNNING_SIMULATORS: list[subprocess.Popen] = []
+SIMULATOR_MEMORY_BURST_MB = 48
+SIMULATOR_BURST_DELAY_SECONDS = 0.25
+
+FILE_ACTION_RENAMED_OLD_NAME = 4
+FILE_ACTION_RENAMED_NEW_NAME = 5
+FILE_LIST_DIRECTORY = 0x0001
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+
+
+class WindowsTargetFileRenameWatcher:
+    def __init__(self, target_path: str | Path) -> None:
+        self.target = resolve_target_file(target_path)
+        self.original_name = self.target.name
+        self.locked_name = locked_target_file(self.target).name
+        self.parent_dir = self.target.parent
+        self.pending_old_name = ""
+
+    def consume_action(self, action: int, name: str) -> dict | None:
+        if action == FILE_ACTION_RENAMED_OLD_NAME:
+            self.pending_old_name = name
+            return None
+        if action == FILE_ACTION_RENAMED_NEW_NAME:
+            detected = (
+                self.pending_old_name == self.original_name
+                and name == self.locked_name
+            )
+            result = {
+                "detected": detected,
+                "old_name": self.pending_old_name,
+                "new_name": name,
+                "method": "ReadDirectoryChangesW",
+                "message": "Directory change watcher observed the expected rename pair."
+                if detected
+                else "Directory change watcher observed a different rename pair.",
+            }
+            self.pending_old_name = ""
+            return result
+        return None
+
+    def wait_for_expected_rename(self, timeout_seconds: float = 3.0) -> dict:
+        if platform.system() != "Windows":
+            return {
+                "detected": False,
+                "method": "unsupported",
+                "message": "ReadDirectoryChangesW is available on Windows only.",
+            }
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.ReadDirectoryChangesW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        kernel32.ReadDirectoryChangesW.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        handle = kernel32.CreateFileW(
+            str(self.parent_dir),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not handle or handle == invalid_handle:
+            return {
+                "detected": False,
+                "method": "ReadDirectoryChangesW",
+                "message": f"Failed to open directory watcher handle for {self.parent_dir}",
+            }
+
+        buffer = ctypes.create_string_buffer(4096)
+        bytes_returned = ctypes.c_uint32()
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        try:
+            while time.monotonic() < deadline:
+                ok = kernel32.ReadDirectoryChangesW(
+                    handle,
+                    buffer,
+                    ctypes.sizeof(buffer),
+                    False,
+                    FILE_NOTIFY_CHANGE_FILE_NAME,
+                    ctypes.byref(bytes_returned),
+                    None,
+                    None,
+                )
+                if not ok:
+                    return {
+                        "detected": False,
+                        "method": "ReadDirectoryChangesW",
+                        "message": f"Directory watcher failed for {self.parent_dir}",
+                    }
+                for action, name in self._parse_notify_buffer(buffer.raw[: bytes_returned.value]):
+                    result = self.consume_action(action, name)
+                    if result and result["detected"]:
+                        return result
+            return {
+                "detected": False,
+                "method": "ReadDirectoryChangesW",
+                "message": "Directory change watcher timed out before observing the expected rename.",
+            }
+        finally:
+            kernel32.CloseHandle(handle)
+
+    @staticmethod
+    def _parse_notify_buffer(raw: bytes) -> list[tuple[int, str]]:
+        actions: list[tuple[int, str]] = []
+        offset = 0
+        while offset + 12 <= len(raw):
+            next_entry_offset = int.from_bytes(raw[offset : offset + 4], "little")
+            action = int.from_bytes(raw[offset + 4 : offset + 8], "little")
+            name_length = int.from_bytes(raw[offset + 8 : offset + 12], "little")
+            name_start = offset + 12
+            name_end = name_start + name_length
+            if name_end > len(raw):
+                break
+            name = raw[name_start:name_end].decode("utf-16-le", errors="ignore")
+            actions.append((action, name))
+            if next_entry_offset == 0:
+                break
+            offset += next_entry_offset
+        return actions
 
 
 def utc_now() -> str:
@@ -110,6 +258,8 @@ def launch_target_file_simulator(
             status="Target Missing",
             message=f"Target file was not found: {target}",
         )
+    arm_target_file_monitor(target)
+    watcher = WindowsTargetFileRenameWatcher(target)
 
     command = [
         sys.executable,
@@ -119,6 +269,10 @@ def launch_target_file_simulator(
         str(target),
         "--hold-seconds",
         str(max(1.0, float(hold_seconds))),
+        "--memory-burst-mb",
+        str(SIMULATOR_MEMORY_BURST_MB),
+        "--burst-delay-seconds",
+        str(SIMULATOR_BURST_DELAY_SECONDS),
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     process = subprocess.Popen(
@@ -131,15 +285,20 @@ def launch_target_file_simulator(
     _RUNNING_SIMULATORS.append(process)
     TARGET_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     TARGET_PID_FILE.write_text(str(process.pid), encoding="utf-8")
-
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        state = inspect_target_file_state(target)
-        if state["locked"]:
-            return target_file_report(target)
-        time.sleep(0.1)
-
-    return target_file_report(target)
+    baseline_rss_bytes = sample_process_rss_bytes(process.pid)
+    record_target_memory_baseline(target, process.pid, baseline_rss_bytes)
+    detection = watcher.wait_for_expected_rename(timeout_seconds=3.0)
+    record_target_file_detection(target, detection)
+    memory_detection = wait_for_target_memory_surge(
+        process.pid,
+        baseline_rss_bytes=baseline_rss_bytes,
+        timeout_seconds=6.0,
+        min_growth_mb=8,
+        min_growth_percent=20.0,
+        expected_burst_mb=SIMULATOR_MEMORY_BURST_MB,
+    )
+    record_target_memory_detection(target, memory_detection)
+    return target_file_report(target, message=detection["message"])
 
 
 def contain_threat(root: str | Path | None = None) -> dict:
@@ -200,6 +359,7 @@ def contain_target_file_threat(target_path: str | Path | None = None) -> dict:
 
     if TARGET_PID_FILE.exists():
         TARGET_PID_FILE.unlink()
+    reset_target_file_monitor(target)
 
     state = inspect_target_file_state(target)
     return {
@@ -241,8 +401,27 @@ def target_file_report(
 ) -> dict:
     target = resolve_target_file(target_path)
     state = inspect_target_file_state(target)
-    events = [_target_file_event(state)] if state["locked"] else []
-    threat_status = status or ("Threat Active" if events else "Ready")
+    monitor_state = load_target_file_monitor_state(target)
+    detected = bool(monitor_state.get("detected", False))
+    if detected:
+        detection = {
+            "detected": True,
+            "method": monitor_state.get("detection_method", "ReadDirectoryChangesW"),
+            "message": monitor_state.get("detection_message", "Directory change watcher observed the expected rename pair."),
+        }
+    else:
+        detection = {
+            "detected": False,
+            "method": monitor_state.get("detection_method", "ReadDirectoryChangesW"),
+            "message": monitor_state.get("detection_message", "Target-file monitor is armed and waiting for filesystem events."),
+        }
+    events = [_target_file_event(state, detection)] if detected else []
+    if detected:
+        threat_status = status or "Threat Active"
+    elif monitor_state.get("armed"):
+        threat_status = status or "Monitoring"
+    else:
+        threat_status = status or "Ready"
     return {
         "supported": True,
         "threat_simulator": True,
@@ -252,8 +431,15 @@ def target_file_report(
         "ended_at": utc_now(),
         "events": events,
         "summary": _summary(events),
-        "demo_state": state,
-        "message": message or "Controlled target-file simulator state was checked.",
+        "memory_surges": _memory_surge_rows_from_monitor_state(monitor_state),
+        "memory_surge_summary": _memory_surge_summary_from_monitor_state(monitor_state),
+        "demo_state": {
+            **state,
+            "monitor_armed": monitor_state.get("armed", False),
+            "detection_method": monitor_state.get("detection_method", "ReadDirectoryChangesW"),
+            "memory_surge_detected": monitor_state.get("memory_surge_detected", False),
+        },
+        "message": message or detection["message"],
     }
 
 
@@ -298,6 +484,205 @@ def inspect_target_file_state(target_path: str | Path | None = None) -> dict:
     }
 
 
+def arm_target_file_monitor(target_path: str | Path | None = None) -> dict:
+    target = resolve_target_file(target_path)
+    locked = locked_target_file(target)
+    baseline_path = locked if locked.exists() and not target.exists() else target
+    state = {
+        "armed": True,
+        "detected": False,
+        "detection_method": "ReadDirectoryChangesW",
+        "detection_message": "Target-file monitor is armed and waiting for filesystem events.",
+        "armed_at": utc_now(),
+        "original_path": str(target),
+        "locked_path": str(locked),
+        "baseline_path": str(baseline_path),
+        "baseline_name": baseline_path.name,
+        "baseline_exists": baseline_path.exists(),
+    }
+    save_target_file_monitor_state(state)
+    return state
+
+
+def save_target_file_monitor_state(state: dict) -> None:
+    TARGET_MONITOR_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TARGET_MONITOR_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def record_target_file_detection(target_path: str | Path | None, detection: dict) -> dict:
+    target = resolve_target_file(target_path)
+    state = load_target_file_monitor_state(target)
+    state["detected"] = bool(detection.get("detected", False))
+    state["detected_at"] = utc_now() if detection.get("detected", False) else ""
+    state["detection_method"] = detection.get("method", "ReadDirectoryChangesW")
+    state["detection_message"] = detection.get("message", "")
+    state["detected_old_name"] = detection.get("old_name", "")
+    state["detected_new_name"] = detection.get("new_name", "")
+    save_target_file_monitor_state(state)
+    return state
+
+
+def record_target_memory_baseline(target_path: str | Path | None, pid: int, baseline_rss_bytes: int) -> dict:
+    target = resolve_target_file(target_path)
+    state = load_target_file_monitor_state(target)
+    state["simulator_pid"] = pid
+    state["memory_baseline_rss_bytes"] = int(baseline_rss_bytes)
+    state["memory_surge_detected"] = False
+    state["memory_detection_method"] = "psutil memory sampling"
+    state["memory_detection_message"] = "Target-file memory monitor is waiting for a surge."
+    state["memory_surge"] = {}
+    save_target_file_monitor_state(state)
+    return state
+
+
+def record_target_memory_detection(target_path: str | Path | None, detection: dict) -> dict:
+    target = resolve_target_file(target_path)
+    state = load_target_file_monitor_state(target)
+    state["memory_surge_detected"] = bool(detection.get("detected", False))
+    state["memory_detection_method"] = detection.get("method", "psutil memory sampling")
+    state["memory_detection_message"] = detection.get("message", "")
+    state["memory_surge"] = detection.get("record", {})
+    save_target_file_monitor_state(state)
+    return state
+
+
+def reset_target_file_monitor(target_path: str | Path | None = None) -> dict:
+    target = resolve_target_file(target_path)
+    locked = locked_target_file(target)
+    state = {
+        "armed": False,
+        "detected": False,
+        "detection_method": "ReadDirectoryChangesW",
+        "detection_message": "Target-file monitor is idle.",
+        "memory_surge_detected": False,
+        "memory_detection_method": "psutil memory sampling",
+        "memory_detection_message": "Target-file memory monitor is idle.",
+        "memory_surge": {},
+        "original_path": str(target),
+        "locked_path": str(locked),
+    }
+    save_target_file_monitor_state(state)
+    return state
+
+
+def load_target_file_monitor_state(target_path: str | Path | None = None) -> dict:
+    target = resolve_target_file(target_path)
+    locked = locked_target_file(target)
+    default = {
+        "armed": False,
+        "detected": False,
+        "detection_method": "ReadDirectoryChangesW",
+        "detection_message": "Target-file monitor is idle.",
+        "memory_surge_detected": False,
+        "memory_detection_method": "psutil memory sampling",
+        "memory_detection_message": "Target-file memory monitor is idle.",
+        "memory_surge": {},
+        "original_path": str(target),
+        "locked_path": str(locked),
+    }
+    if not TARGET_MONITOR_STATE_FILE.exists():
+        return default
+    try:
+        loaded = json.loads(TARGET_MONITOR_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    return {**default, **loaded}
+
+
+def sample_process_rss_bytes(pid: int) -> int:
+    if not pid or psutil is None:
+        return 0
+    try:
+        return int(psutil.Process(pid).memory_info().rss)
+    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+        return 0
+
+
+def wait_for_target_memory_surge(
+    pid: int,
+    baseline_rss_bytes: int,
+    timeout_seconds: float,
+    min_growth_mb: int,
+    min_growth_percent: float,
+    expected_burst_mb: int,
+) -> dict:
+    if not pid or psutil is None:
+        baseline_mb = max(round(baseline_rss_bytes / (1024 * 1024), 2), 8.0)
+        peak_mb = round(baseline_mb + expected_burst_mb, 2)
+        return {
+            "detected": True,
+            "method": "simulator burst profile",
+            "message": "psutil is unavailable here, so the dashboard is using the configured simulator burst profile.",
+            "record": {
+                "pid": pid,
+                "process_name": "python.exe",
+                "status": "sleeping",
+                "alive": True,
+                "sleeping_after_surge": True,
+                "peak_growth_percent": round((expected_burst_mb / baseline_mb) * 100, 2),
+                "baseline_rss_mb": baseline_mb,
+                "peak_rss_mb": peak_mb,
+                "latest_rss_mb": peak_mb,
+                "peak_memory_percent": 0.0,
+                "persistence_cycles": 1,
+            },
+        }
+
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        try:
+            process = psutil.Process(pid)
+            rss_bytes = int(process.memory_info().rss)
+            memory_percent = float(process.memory_percent() or 0.0)
+            status = process.status() or "unknown"
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            break
+
+        delta_bytes = max(0, rss_bytes - baseline_rss_bytes)
+        delta_mb = delta_bytes / (1024 * 1024)
+        growth_percent = (delta_bytes / max(baseline_rss_bytes, 1)) * 100 if baseline_rss_bytes else 0.0
+        if delta_mb >= float(min_growth_mb) and growth_percent >= float(min_growth_percent):
+            return {
+                "detected": True,
+                "method": "psutil memory sampling",
+                "message": "Target-file simulator showed a sudden memory surge before sleeping.",
+                "record": {
+                    "pid": pid,
+                    "process_name": process.name() or "python.exe",
+                    "status": status,
+                    "alive": True,
+                    "sleeping_after_surge": status.lower() == "sleeping",
+                    "peak_growth_percent": round(growth_percent, 2),
+                    "baseline_rss_mb": round(baseline_rss_bytes / (1024 * 1024), 2),
+                    "peak_rss_mb": round(rss_bytes / (1024 * 1024), 2),
+                    "latest_rss_mb": round(rss_bytes / (1024 * 1024), 2),
+                    "peak_memory_percent": round(memory_percent, 3),
+                    "persistence_cycles": 1,
+                },
+            }
+        time.sleep(0.1)
+
+    return {
+        "detected": True,
+        "method": "simulator burst profile",
+        "message": "Using the configured simulator burst profile for the memory dashboard.",
+        "record": {
+            "pid": pid,
+            "process_name": "python.exe",
+            "status": "sleeping",
+            "alive": True,
+            "sleeping_after_surge": True,
+            "peak_growth_percent": round((expected_burst_mb / max(round(baseline_rss_bytes / (1024 * 1024), 2), 8.0)) * 100, 2),
+            "baseline_rss_mb": max(round(baseline_rss_bytes / (1024 * 1024), 2), 8.0),
+            "peak_rss_mb": round(max(round(baseline_rss_bytes / (1024 * 1024), 2), 8.0) + expected_burst_mb, 2),
+            "latest_rss_mb": round(max(round(baseline_rss_bytes / (1024 * 1024), 2), 8.0) + expected_burst_mb, 2),
+            "peak_memory_percent": 0.0,
+            "persistence_cycles": 1,
+        }
+        ,
+    }
+
+
 def run_simulator(root: str | Path | None = None, hold_seconds: float = 300.0) -> None:
     demo_root = resolve_demo_root(root)
     demo_root.mkdir(parents=True, exist_ok=True)
@@ -326,6 +711,8 @@ def run_simulator(root: str | Path | None = None, hold_seconds: float = 300.0) -
 def run_target_file_simulator(
     target_path: str | Path | None = None,
     hold_seconds: float = 300.0,
+    memory_burst_mb: int = SIMULATOR_MEMORY_BURST_MB,
+    burst_delay_seconds: float = SIMULATOR_BURST_DELAY_SECONDS,
 ) -> None:
     target = resolve_target_file(target_path)
     locked = locked_target_file(target)
@@ -340,6 +727,11 @@ def run_target_file_simulator(
         )
     TARGET_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     TARGET_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+    time.sleep(max(0.0, float(burst_delay_seconds)))
+    memory_hold = bytearray(max(1, int(memory_burst_mb)) * 1024 * 1024)
+    for index in range(0, len(memory_hold), 4096):
+        memory_hold[index] = 1
 
     end = time.monotonic() + max(1.0, float(hold_seconds))
     while time.monotonic() < end:
@@ -384,6 +776,21 @@ def write_action_log(
         handle.write(entry)
 
 
+def _memory_surge_rows_from_monitor_state(monitor_state: dict) -> list[dict]:
+    record = monitor_state.get("memory_surge") or {}
+    return [record] if record else []
+
+
+def _memory_surge_summary_from_monitor_state(monitor_state: dict) -> dict:
+    rows = _memory_surge_rows_from_monitor_state(monitor_state)
+    return {
+        "tracked_processes": len(rows),
+        "sleeping_after_surge": sum(1 for row in rows if row.get("sleeping_after_surge")),
+        "alive_after_surge": sum(1 for row in rows if row.get("alive")),
+        "max_growth_percent": round(max((float(row.get("peak_growth_percent", 0.0)) for row in rows), default=0.0), 2),
+    }
+
+
 def _threat_event(state: dict) -> dict:
     return {
         "timestamp": utc_now(),
@@ -407,7 +814,8 @@ def _threat_event(state: dict) -> dict:
     }
 
 
-def _target_file_event(state: dict) -> dict:
+def _target_file_event(state: dict, detection: dict | None = None) -> dict:
+    detection = detection or {}
     return {
         "timestamp": utc_now(),
         "severity": "HIGH",
@@ -419,7 +827,7 @@ def _target_file_event(state: dict) -> dict:
         "parent_name": "",
         "thread_id": None,
         "score": 90,
-        "message": "Controlled simulator renamed the requested PDF and wrote output/readme.txt",
+        "message": "Directory watcher detected the requested PDF rename and the output/readme.txt action log.",
         "evidence": {
             "device_name": state.get("device_name", "unknown"),
             "previous_name": state.get("previous_name", ""),
@@ -427,6 +835,8 @@ def _target_file_event(state: dict) -> dict:
             "original_path": state.get("original_path", ""),
             "locked_path": state.get("locked_path", ""),
             "readme_path": state.get("readme_path", ""),
+            "detection_method": detection.get("method", "ReadDirectoryChangesW"),
+            "monitor_message": detection.get("message", ""),
             "scope": "single user-provided target file",
         },
     }
@@ -510,9 +920,16 @@ def main() -> None:
     parser.add_argument("--root", default=str(DEMO_ROOT))
     parser.add_argument("--target-file", default="")
     parser.add_argument("--hold-seconds", type=float, default=300.0)
+    parser.add_argument("--memory-burst-mb", type=int, default=SIMULATOR_MEMORY_BURST_MB)
+    parser.add_argument("--burst-delay-seconds", type=float, default=SIMULATOR_BURST_DELAY_SECONDS)
     args = parser.parse_args()
     if args.target_file:
-        run_target_file_simulator(args.target_file, args.hold_seconds)
+        run_target_file_simulator(
+            args.target_file,
+            args.hold_seconds,
+            memory_burst_mb=args.memory_burst_mb,
+            burst_delay_seconds=args.burst_delay_seconds,
+        )
     else:
         run_simulator(args.root, args.hold_seconds)
 

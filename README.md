@@ -8,6 +8,7 @@ This project now includes both:
 - A Windows-only live behavior monitor for anti-injection and anti-exploitation signals
 - Live TCP/UDP port checking for listeners and active remote connections
 - A controlled file-lock threat simulator with one-click containment and restore
+- A memory-surge dashboard that tracks sudden per-process RSS growth and sleep-like persistence
 - A Streamlit frontend that wraps both workflows in a browser UI
 
 ## Features
@@ -42,7 +43,8 @@ This project now includes both:
 - Track newly observed private executable-memory regions in sensitive processes
 - Watch suspicious executable regions for sleep-obfuscation style page-protection flips
 - Check live TCP/UDP ports, exposed listeners, and public remote-control or file-transfer connections
-- Run the controlled target-file demo: rename `C:\Users\HP\Downloads\Resume updated June.pdf` to `Resume updated June_LOCKED.pdf`, record previous/current names in `output/readme.txt`, raise a HIGH alert with score 90, then contain the simulator and restore the original name
+- Track processes that suddenly grow memory by percentage increase, then stay alive or enter sleep-like states
+- Run the controlled target-file demo: arm a `ReadDirectoryChangesW` directory watcher, detect `C:\Users\HP\Downloads\Resume updated June.pdf` being renamed to `Resume updated June_LOCKED.pdf`, record previous/current names in `output/readme.txt`, raise a HIGH alert with score 90, then contain the simulator and restore the original name
 - Export monitoring reports as JSON
 
 ## Setup

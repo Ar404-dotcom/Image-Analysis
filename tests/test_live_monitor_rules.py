@@ -10,10 +10,12 @@ if str(ROOT) not in sys.path:
 
 from live_monitor.windows_monitor import (
     BehaviorRuleEngine,
+    MemorySurgeRecord,
     MemoryRegion,
     MonitorConfig,
     NetworkPortInfo,
     ProcessInfo,
+    ProcessMemorySample,
     ThreadInfo,
     WindowsBehaviorMonitor,
     WindowsApiProbe,
@@ -306,6 +308,91 @@ class LiveMonitorRuleTests(unittest.TestCase):
         self.assertEqual(summary["listeners"], 1)
         self.assertEqual(summary["established_public_connections"], 1)
         self.assertEqual(summary["exposed_listeners"], 1)
+
+    def test_memory_growth_event_uses_percentage_increase(self):
+        process = ProcessInfo(pid=700, parent_pid=4, name="allocator.exe", path=r"C:\Temp\allocator.exe")
+        previous = ProcessMemorySample(pid=700, rss_bytes=20 * 1024 * 1024, memory_percent=0.5, status="running")
+        current = ProcessMemorySample(pid=700, rss_bytes=80 * 1024 * 1024, memory_percent=2.5, status="running")
+
+        events = self.rules.memory_growth_events(process, previous, current)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].category, "sudden_memory_growth")
+        self.assertEqual(events[0].severity, "HIGH")
+        self.assertGreater(events[0].evidence["growth_percent"], 200)
+
+    def test_memory_surge_sleep_event_flags_sleep_like_status(self):
+        process = ProcessInfo(pid=701, parent_pid=4, name="sleeper.exe", path=r"C:\Temp\sleeper.exe")
+        record = MemorySurgeRecord(
+            pid=701,
+            process_name="sleeper.exe",
+            process_path=r"C:\Temp\sleeper.exe",
+            first_seen="2026-01-01T00:00:00+00:00",
+            last_seen="2026-01-01T00:00:05+00:00",
+            baseline_rss_bytes=10 * 1024 * 1024,
+            peak_rss_bytes=120 * 1024 * 1024,
+            latest_rss_bytes=120 * 1024 * 1024,
+            peak_growth_percent=1100.0,
+            latest_growth_percent=0.0,
+            peak_memory_percent=4.2,
+            latest_memory_percent=4.2,
+            status="sleeping",
+            persistence_cycles=3,
+            sleeping_after_surge=True,
+        )
+
+        events = self.rules.memory_surge_sleep_events(process, record)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].category, "memory_surge_then_sleep")
+        self.assertEqual(events[0].severity, "MEDIUM")
+
+    def test_memory_surge_summary_counts_sleeping_and_alive_processes(self):
+        records = {
+            1: MemorySurgeRecord(
+                pid=1,
+                process_name="a.exe",
+                process_path="",
+                first_seen="x",
+                last_seen="x",
+                baseline_rss_bytes=1,
+                peak_rss_bytes=2,
+                latest_rss_bytes=2,
+                peak_growth_percent=150.0,
+                latest_growth_percent=10.0,
+                peak_memory_percent=1.0,
+                latest_memory_percent=1.0,
+                status="sleeping",
+                persistence_cycles=2,
+                sleeping_after_surge=True,
+                alive=True,
+            ),
+            2: MemorySurgeRecord(
+                pid=2,
+                process_name="b.exe",
+                process_path="",
+                first_seen="x",
+                last_seen="x",
+                baseline_rss_bytes=1,
+                peak_rss_bytes=2,
+                latest_rss_bytes=2,
+                peak_growth_percent=90.0,
+                latest_growth_percent=0.0,
+                peak_memory_percent=0.5,
+                latest_memory_percent=0.4,
+                status="running",
+                persistence_cycles=1,
+                sleeping_after_surge=False,
+                alive=False,
+            ),
+        }
+
+        summary = WindowsBehaviorMonitor._memory_surge_summary(records)
+
+        self.assertEqual(summary["tracked_processes"], 2)
+        self.assertEqual(summary["sleeping_after_surge"], 1)
+        self.assertEqual(summary["alive_after_surge"], 1)
+        self.assertEqual(summary["max_growth_percent"], 150.0)
 
     def test_port_check_summary_uses_max_single_exposure_score(self):
         ports = [

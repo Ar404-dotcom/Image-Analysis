@@ -18,6 +18,7 @@ from live_monitor import (
     DEFAULT_TARGET_FILE,
     MonitorConfig,
     WindowsBehaviorMonitor,
+    arm_target_file_monitor,
     contain_target_file_threat,
     launch_target_file_simulator,
     target_file_report,
@@ -746,6 +747,8 @@ def render_live_monitoring_tab() -> None:
         duration = st.slider("Session duration", min_value=5, max_value=120, value=20, step=5)
         interval = st.slider("Polling interval", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
         max_processes = st.slider("Memory scan budget", min_value=10, max_value=200, value=80, step=10)
+        memory_growth_threshold = st.slider("Memory growth threshold (%)", min_value=25, max_value=400, value=80, step=5)
+        memory_growth_min_mb = st.slider("Minimum memory jump (MB)", min_value=5, max_value=256, value=25, step=5)
 
     with right:
         inspect_threads = st.checkbox("Inspect new thread start addresses", value=True)
@@ -753,6 +756,7 @@ def render_live_monitoring_tab() -> None:
         inspect_transitions = st.checkbox("Detect sleep-obfuscation page transitions", value=True)
         include_process_starts = st.checkbox("Evaluate new process starts", value=True)
         inspect_network_ports = st.checkbox("Check live network ports", value=True)
+        inspect_memory_growth = st.checkbox("Track sudden memory growth", value=True)
 
     st.markdown(
         """
@@ -770,7 +774,7 @@ def render_live_monitoring_tab() -> None:
 
     st.markdown("#### Controlled Target File Simulator")
     st.caption(
-        f"Renames `{DEFAULT_TARGET_FILE}` to a `_LOCKED` name, records previous/current names in `output/readme.txt`, then lets containment restore it."
+        f"Arms a Windows directory watcher for `{DEFAULT_TARGET_FILE}`, detects the rename to a `_LOCKED` name, records previous/current names in `output/readme.txt`, then lets containment restore it."
     )
     sim_col_a, sim_col_b, sim_col_c, sim_col_d = st.columns([1, 1, 1, 1], gap="large")
     with sim_col_a:
@@ -793,6 +797,7 @@ def render_live_monitoring_tab() -> None:
         run_demo = st.button("Run telemetry sleep demo", use_container_width=True)
 
     if prepare_simulator:
+        arm_target_file_monitor()
         st.session_state["live_monitor_report"] = target_file_report()
 
     if start_simulator:
@@ -817,6 +822,9 @@ def render_live_monitoring_tab() -> None:
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
             inspect_network_ports=inspect_network_ports,
+            inspect_memory_growth=inspect_memory_growth,
+            memory_growth_percent_threshold=float(memory_growth_threshold),
+            memory_growth_min_mb=int(memory_growth_min_mb),
         )
         monitor = WindowsBehaviorMonitor(config)
         progress = st.progress(0.0)
@@ -840,6 +848,9 @@ def render_live_monitoring_tab() -> None:
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
             inspect_network_ports=inspect_network_ports,
+            inspect_memory_growth=inspect_memory_growth,
+            memory_growth_percent_threshold=float(memory_growth_threshold),
+            memory_growth_min_mb=int(memory_growth_min_mb),
         )
         with st.spinner("Checking live TCP and UDP ports..."):
             st.session_state["live_monitor_report"] = WindowsBehaviorMonitor(config).port_check_report()
@@ -855,6 +866,9 @@ def render_live_monitoring_tab() -> None:
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
             inspect_network_ports=inspect_network_ports,
+            inspect_memory_growth=inspect_memory_growth,
+            memory_growth_percent_threshold=float(memory_growth_threshold),
+            memory_growth_min_mb=int(memory_growth_min_mb),
         )
         st.session_state["live_monitor_report"] = WindowsBehaviorMonitor(config).self_test_report()
 
@@ -869,6 +883,9 @@ def render_live_monitoring_tab() -> None:
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
             inspect_network_ports=inspect_network_ports,
+            inspect_memory_growth=inspect_memory_growth,
+            memory_growth_percent_threshold=float(memory_growth_threshold),
+            memory_growth_min_mb=int(memory_growth_min_mb),
         )
         progress = st.progress(0.0)
         status = st.empty()
@@ -894,6 +911,7 @@ def render_live_monitoring_tab() -> None:
 
     summary = report.get("summary", {})
     network_summary = report.get("network_summary") or summary.get("network", {})
+    memory_surge_summary = report.get("memory_surge_summary", {})
     configuration = report.get("configuration", {})
     events = report.get("events", [])
     score = int(summary.get("risk_score", 0))
@@ -973,6 +991,8 @@ def render_live_monitoring_tab() -> None:
                 {"Field": "Log path", "Value": demo_state.get("readme_path", "")},
                 {"Field": "Simulator PID", "Value": demo_state.get("simulator_pid", 0)},
                 {"Field": "Simulator running", "Value": demo_state.get("simulator_running", False)},
+                {"Field": "Monitor armed", "Value": demo_state.get("monitor_armed", False)},
+                {"Field": "Detection method", "Value": demo_state.get("detection_method", "")},
                 {"Field": "Process terminated", "Value": demo_state.get("terminated_process", "")},
                 {"Field": "Restored", "Value": demo_state.get("restored", "")},
             ]
@@ -990,6 +1010,44 @@ def render_live_monitoring_tab() -> None:
         st.dataframe(state_rows, use_container_width=True, hide_index=True)
 
     network_ports = report.get("network_ports", [])
+    memory_surges = report.get("memory_surges", [])
+    st.markdown("#### Memory Surge Dashboard")
+    st.caption("Processes are ranked by percentage growth from the previous sample, then tracked even if they later become quiet or sleep-like.")
+    surge_cols = st.columns(4)
+    surge_metrics = [
+        ("Tracked surges", "tracked_processes"),
+        ("Peak growth %", "max_growth_percent"),
+        ("Alive after surge", "alive_after_surge"),
+        ("Sleeping after surge", "sleeping_after_surge"),
+    ]
+    for column, (label, key) in zip(surge_cols, surge_metrics):
+        with column:
+            st.metric(label, memory_surge_summary.get(key, 0))
+
+    if memory_surges:
+        st.dataframe(
+            [
+                {
+                    "Process": surge["process_name"],
+                    "PID": surge["pid"],
+                    "Status": surge["status"],
+                    "Alive": surge["alive"],
+                    "Sleeping After Surge": surge["sleeping_after_surge"],
+                    "Peak Growth %": surge["peak_growth_percent"],
+                    "Baseline RSS MB": surge["baseline_rss_mb"],
+                    "Peak RSS MB": surge["peak_rss_mb"],
+                    "Latest RSS MB": surge["latest_rss_mb"],
+                    "Peak Memory %": surge["peak_memory_percent"],
+                    "Persistence Cycles": surge["persistence_cycles"],
+                }
+                for surge in memory_surges
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No sudden memory-growth processes have been observed in the current report yet. Start a live monitoring session and let it run long enough to sample a surge.")
+
     if network_ports:
         st.markdown("#### Live Network Ports")
         st.caption("This shows current listeners and connections. It can reveal possible transfer paths, but port state alone does not prove that files or screen data were sent.")

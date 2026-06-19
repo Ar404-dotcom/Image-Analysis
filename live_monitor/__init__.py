@@ -7,6 +7,7 @@ for process and memory telemetry on Windows.
 
 from .threat_simulator import (
     DEFAULT_TARGET_FILE,
+    arm_target_file_monitor,
     contain_target_file_threat,
     contain_threat,
     launch_target_file_simulator,
@@ -23,6 +24,7 @@ __all__ = [
     "NetworkPortInfo",
     "WindowsBehaviorMonitor",
     "DEFAULT_TARGET_FILE",
+    "arm_target_file_monitor",
     "contain_target_file_threat",
     "contain_threat",
     "launch_target_file_simulator",
