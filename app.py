@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import platform
 import tempfile
 from collections import Counter
@@ -12,7 +13,15 @@ import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
 from converter import image_to_asm, image_to_base64, image_to_binary_string
-from live_monitor import MonitorConfig, WindowsBehaviorMonitor
+from file_reputation import build_reputation_report, demo_reputation_report
+from live_monitor import (
+    DEFAULT_TARGET_FILE,
+    MonitorConfig,
+    WindowsBehaviorMonitor,
+    contain_target_file_threat,
+    launch_target_file_simulator,
+    target_file_report,
+)
 from malware_scanner import MalwareScanner
 
 
@@ -194,6 +203,35 @@ def behavior_risk_band(summary: dict) -> tuple[str, str]:
     return "Clean", "#256245"
 
 
+def reputation_band(verdict: dict) -> tuple[str, str]:
+    severity = str(verdict.get("severity", "UNKNOWN")).upper()
+    if severity == "CRITICAL":
+        return "Critical", "#8a2d1d"
+    if severity == "HIGH":
+        return "High", "#b64d1f"
+    if severity == "MEDIUM":
+        return "Medium", "#bd7c16"
+    if severity == "LOW":
+        return "Low", "#567a12"
+    if severity == "CLEAN":
+        return "Clean", "#256245"
+    return "Unknown", "#7b8798"
+
+
+def port_exposure_band(summary: dict) -> tuple[str, str]:
+    severities = summary.get("severity_counts", {})
+    categories = summary.get("category_counts", {})
+    if severities.get("CRITICAL", 0):
+        return "Critical", "#8a2d1d"
+    if severities.get("HIGH", 0):
+        return "High", "#b64d1f"
+    if categories.get("public_remote_control_or_file_port", 0):
+        return "Medium", "#bd7c16"
+    if categories.get("network_listener_all_interfaces", 0) or categories.get("network_listener_reachable_interface", 0):
+        return "Low", "#567a12"
+    return "Clean", "#256245"
+
+
 def open_uploaded_image(uploaded_file) -> Image.Image | None:
     try:
         image = Image.open(io.BytesIO(uploaded_file.getvalue()))
@@ -279,6 +317,7 @@ def render_hero() -> None:
                 <div class="pill">Image preview</div>
                 <div class="pill">ASM / Binary / Base64 export</div>
                 <div class="pill">Malware risk scoring</div>
+                <div class="pill">File reputation</div>
                 <div class="pill">Live monitoring</div>
                 <div class="pill">Finding breakdowns</div>
             </div>
@@ -533,9 +572,170 @@ def render_scan_result(result: dict | None, console_output: str, report_name: st
     )
 
 
+def render_reputation_tab() -> None:
+    st.markdown("### File Reputation Checker")
+    st.caption(
+        "Upload any file to calculate hashes, check Windows signature status, and optionally query an online reputation service by SHA-256 hash."
+    )
+
+    left, right = st.columns([1.1, 0.9], gap="large")
+    with left:
+        uploaded = st.file_uploader(
+            "Choose a file to verify",
+            key="reputation_uploader",
+        )
+    with right:
+        query_online = st.checkbox("Query VirusTotal by hash", value=False)
+        configured_key = bool(os.getenv("VIRUSTOTAL_API_KEY"))
+        api_key = st.text_input(
+            "VirusTotal API key",
+            type="password",
+            value="",
+            placeholder="Using VIRUSTOTAL_API_KEY" if configured_key else "Optional",
+            help="Only the SHA-256 hash is sent. The file contents are not uploaded.",
+            disabled=not query_online,
+        )
+        run_demo = st.button("Run clean demo check", use_container_width=True)
+
+    st.markdown(
+        """
+        <div class="panel">
+            Reputation checks are strongest when the hash is already known by an online service
+            or when the file has a valid Windows Authenticode signature. Unknown does not mean
+            malicious; it means the checker cannot prove authenticity from available signals.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if run_demo:
+        st.session_state["file_reputation_report"] = demo_reputation_report()
+
+    if uploaded:
+        suffix = Path(uploaded.name).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded.getvalue())
+            temp_path = tmp.name
+
+        try:
+            with st.spinner("Checking file identity and reputation..."):
+                st.session_state["file_reputation_report"] = build_reputation_report(
+                    uploaded.getvalue(),
+                    uploaded.name,
+                    signature_path=temp_path,
+                    query_online=query_online,
+                    api_key=api_key or None,
+                )
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
+
+    report = st.session_state.get("file_reputation_report")
+    if not report:
+        st.info("Upload a file or run the demo to start a reputation check.")
+        return
+
+    render_reputation_report(report)
+
+
+def render_reputation_report(report: dict) -> None:
+    verdict = report.get("verdict", {})
+    hashes = report.get("hashes", {})
+    signature = report.get("signature", {})
+    online = report.get("online_reputation", {})
+    level, color = reputation_band(verdict)
+
+    top_a, top_b, top_c = st.columns(3, gap="large")
+    with top_a:
+        st.markdown(
+            f"""
+            <div class="risk-card">
+                <h3>Reputation Verdict</h3>
+                <div class="risk-value" style="color:{color};">{level}</div>
+                <div class="section-label">{verdict.get("label", "Unknown")}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_b:
+        st.markdown(
+            f"""
+            <div class="risk-card">
+                <h3>File Size</h3>
+                <div class="risk-value">{int(report.get("file_size", 0)):,}</div>
+                <div class="section-label">bytes</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_c:
+        st.markdown(
+            f"""
+            <div class="risk-card">
+                <h3>Entropy</h3>
+                <div class="risk-value">{float(report.get("entropy", 0.0)):.3f}</div>
+                <div class="section-label">0 to 8 byte distribution</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.info(verdict.get("message", "No reputation message is available."))
+    st.caption(report.get("privacy_note", "Only file hashes are used for online lookup."))
+
+    st.markdown("#### File Hashes")
+    st.dataframe(
+        [{"Algorithm": key.upper(), "Hash": value} for key, value in hashes.items()],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    detail_cols = st.columns(2, gap="large")
+    with detail_cols[0]:
+        st.markdown("#### Signature")
+        st.dataframe(
+            [
+                {"Field": "Status", "Value": signature.get("status", "")},
+                {"Field": "Subject", "Value": signature.get("subject", "")},
+                {"Field": "Message", "Value": signature.get("message", "")},
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    with detail_cols[1]:
+        st.markdown("#### Online Reputation")
+        stats = online.get("stats") or {}
+        st.dataframe(
+            [
+                {"Field": "Service", "Value": online.get("service", "VirusTotal")},
+                {"Field": "Queried", "Value": online.get("queried", False)},
+                {"Field": "Found", "Value": online.get("found", False)},
+                {"Field": "Malicious", "Value": stats.get("malicious", 0)},
+                {"Field": "Suspicious", "Value": stats.get("suspicious", 0)},
+                {"Field": "Harmless", "Value": stats.get("harmless", 0)},
+                {"Field": "Error", "Value": online.get("error", "")},
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        if online.get("link"):
+            st.markdown(f"[Open reputation details]({online['link']})")
+
+    with st.expander("Reputation report JSON"):
+        st.code(json.dumps(report, indent=2), language="json")
+
+    st.download_button(
+        label="Download reputation report",
+        data=json.dumps(report, indent=2),
+        file_name=f"{Path(report.get('filename', 'file')).stem}_reputation_report.json",
+        mime="application/json",
+    )
+
+
 def render_live_monitoring_tab() -> None:
     st.markdown("### Live Monitoring")
-    st.caption("Run a bounded Windows behavior-monitoring session for process, thread, private executable-memory, and page-transition signals.")
+    st.caption(
+        "Run a bounded Windows behavior-monitoring session, or launch a local-only demo that collects low-sensitivity host facts and detects the follow-on sleep pattern."
+    )
 
     is_windows = platform.system() == "Windows"
     if not is_windows:
@@ -552,6 +752,7 @@ def render_live_monitoring_tab() -> None:
         inspect_memory = st.checkbox("Inspect private executable memory", value=True)
         inspect_transitions = st.checkbox("Detect sleep-obfuscation page transitions", value=True)
         include_process_starts = st.checkbox("Evaluate new process starts", value=True)
+        inspect_network_ports = st.checkbox("Check live network ports", value=True)
 
     st.markdown(
         """
@@ -560,16 +761,50 @@ def render_live_monitoring_tab() -> None:
             thread starts inside private executable memory, process masquerading, and newly
             observed executable private regions in sensitive processes. Page-transition tracking
             watches those regions for sleep-obfuscation style flips to non-executable protections.
+            Port checking lists live listeners and active connections to help verify possible
+            screen-share, remote-control, or file-transfer paths.
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    action_col, test_col = st.columns([1, 1], gap="large")
+    st.markdown("#### Controlled Target File Simulator")
+    st.caption(
+        f"Renames `{DEFAULT_TARGET_FILE}` to a `_LOCKED` name, records previous/current names in `output/readme.txt`, then lets containment restore it."
+    )
+    sim_col_a, sim_col_b, sim_col_c, sim_col_d = st.columns([1, 1, 1, 1], gap="large")
+    with sim_col_a:
+        prepare_simulator = st.button("Start demo monitor", use_container_width=True)
+    with sim_col_b:
+        start_simulator = st.button("Start threat simulator", use_container_width=True)
+    with sim_col_c:
+        refresh_simulator = st.button("Refresh simulator status", use_container_width=True)
+    with sim_col_d:
+        contain_simulator = st.button("Contain threat", type="primary", use_container_width=True)
+
+    action_col, port_col, self_test_col, demo_col = st.columns([1, 1, 1, 1], gap="large")
     with action_col:
         start = st.button("Start live monitoring session", type="primary", disabled=not is_windows, use_container_width=True)
-    with test_col:
-        run_self_test = st.button("Run detection self-test", use_container_width=True)
+    with port_col:
+        check_ports = st.button("Check live ports now", use_container_width=True)
+    with self_test_col:
+        run_self_test = st.button("Run synthetic rule self-test", use_container_width=True)
+    with demo_col:
+        run_demo = st.button("Run telemetry sleep demo", use_container_width=True)
+
+    if prepare_simulator:
+        st.session_state["live_monitor_report"] = target_file_report()
+
+    if start_simulator:
+        with st.spinner("Launching controlled target-file simulator..."):
+            st.session_state["live_monitor_report"] = launch_target_file_simulator()
+
+    if refresh_simulator:
+        st.session_state["live_monitor_report"] = target_file_report()
+
+    if contain_simulator:
+        with st.spinner("Containing controlled simulator and restoring the target file name..."):
+            st.session_state["live_monitor_report"] = contain_target_file_threat()
 
     if start:
         config = MonitorConfig(
@@ -581,6 +816,7 @@ def render_live_monitoring_tab() -> None:
             transition_watch_seconds=max(10, int(duration)),
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
+            inspect_network_ports=inspect_network_ports,
         )
         monitor = WindowsBehaviorMonitor(config)
         progress = st.progress(0.0)
@@ -593,6 +829,21 @@ def render_live_monitoring_tab() -> None:
         with st.spinner("Monitoring Windows process and memory behavior..."):
             st.session_state["live_monitor_report"] = monitor.run(update_progress)
 
+    if check_ports:
+        config = MonitorConfig(
+            duration_seconds=int(duration),
+            interval_seconds=float(interval),
+            inspect_thread_starts=inspect_threads,
+            inspect_memory_regions=inspect_memory,
+            inspect_page_transitions=inspect_transitions,
+            transition_watch_seconds=max(10, int(duration)),
+            max_processes_per_cycle=int(max_processes),
+            include_process_starts=include_process_starts,
+            inspect_network_ports=inspect_network_ports,
+        )
+        with st.spinner("Checking live TCP and UDP ports..."):
+            st.session_state["live_monitor_report"] = WindowsBehaviorMonitor(config).port_check_report()
+
     if run_self_test:
         config = MonitorConfig(
             duration_seconds=int(duration),
@@ -603,8 +854,34 @@ def render_live_monitoring_tab() -> None:
             transition_watch_seconds=max(10, int(duration)),
             max_processes_per_cycle=int(max_processes),
             include_process_starts=include_process_starts,
+            inspect_network_ports=inspect_network_ports,
         )
         st.session_state["live_monitor_report"] = WindowsBehaviorMonitor(config).self_test_report()
+
+    if run_demo:
+        config = MonitorConfig(
+            duration_seconds=int(duration),
+            interval_seconds=float(interval),
+            inspect_thread_starts=inspect_threads,
+            inspect_memory_regions=inspect_memory,
+            inspect_page_transitions=inspect_transitions,
+            transition_watch_seconds=max(10, int(duration)),
+            max_processes_per_cycle=int(max_processes),
+            include_process_starts=include_process_starts,
+            inspect_network_ports=inspect_network_ports,
+        )
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        def update_demo_progress(value: float) -> None:
+            progress.progress(value)
+            status.caption(f"Demo progress: {int(value * 100)}%")
+
+        with st.spinner("Collecting local demo telemetry and entering sleep interval..."):
+            st.session_state["live_monitor_report"] = WindowsBehaviorMonitor(config).demo_recon_sleep_report(
+                sleep_seconds=3.0,
+                progress_callback=update_demo_progress,
+            )
 
     report = st.session_state.get("live_monitor_report")
     if not report:
@@ -616,10 +893,15 @@ def render_live_monitoring_tab() -> None:
         return
 
     summary = report.get("summary", {})
+    network_summary = report.get("network_summary") or summary.get("network", {})
     configuration = report.get("configuration", {})
     events = report.get("events", [])
     score = int(summary.get("risk_score", 0))
-    level, color = behavior_risk_band(summary)
+    is_port_check = bool(report.get("port_check"))
+    level, color = port_exposure_band(summary) if is_port_check else behavior_risk_band(summary)
+    risk_label = "Port Exposure" if is_port_check else "Behavior Risk"
+    score_label = "Max exposure score" if is_port_check else "Score"
+    is_threat_simulator = bool(report.get("threat_simulator"))
     session_duration = int(configuration.get("duration_seconds", duration))
 
     top_a, top_b, top_c = st.columns(3, gap="large")
@@ -627,9 +909,9 @@ def render_live_monitoring_tab() -> None:
         st.markdown(
             f"""
             <div class="risk-card">
-                <h3>Behavior Risk</h3>
+                <h3>{risk_label}</h3>
                 <div class="risk-value" style="color:{color};">{level}</div>
-                <div class="section-label">Score {score}</div>
+                <div class="section-label">{score_label} {score}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -646,22 +928,109 @@ def render_live_monitoring_tab() -> None:
             unsafe_allow_html=True,
         )
     with top_c:
-        st.markdown(
-            f"""
-            <div class="risk-card">
-                <h3>Session Window</h3>
-                <div class="risk-value">{session_duration}s</div>
-                <div class="section-label">{report.get("started_at", "")} UTC</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        if is_threat_simulator:
+            top_c.markdown(
+                f"""
+                <div class="risk-card">
+                    <h3>Simulator Status</h3>
+                    <div class="risk-value">{report.get("threat_status", "Ready")}</div>
+                    <div class="section-label">{report.get("message", "")}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            top_c.markdown(
+                f"""
+                <div class="risk-card">
+                    <h3>Session Window</h3>
+                    <div class="risk-value">{session_duration}s</div>
+                    <div class="section-label">{report.get("started_at", "")} UTC</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     severity_counts = summary.get("severity_counts", {})
     sev_cols = st.columns(4)
     for column, severity in zip(sev_cols, ["CRITICAL", "HIGH", "MEDIUM", "LOW"]):
         with column:
             st.metric(severity.title(), severity_counts.get(severity, 0))
+
+    demo_state = report.get("demo_state")
+    if demo_state:
+        st.markdown("#### Controlled Demo State")
+        if demo_state.get("target_file_demo"):
+            state_rows = [
+                {"Field": "Device", "Value": demo_state.get("device_name", "")},
+                {"Field": "Original path", "Value": demo_state.get("original_path", "")},
+                {"Field": "Locked path", "Value": demo_state.get("locked_path", "")},
+                {"Field": "Previous name", "Value": demo_state.get("previous_name", "")},
+                {"Field": "Current name", "Value": demo_state.get("current_name", "")},
+                {"Field": "Original exists", "Value": demo_state.get("original_exists", False)},
+                {"Field": "Locked exists", "Value": demo_state.get("locked", False)},
+                {"Field": "Log created", "Value": demo_state.get("readme_created", False)},
+                {"Field": "Log path", "Value": demo_state.get("readme_path", "")},
+                {"Field": "Simulator PID", "Value": demo_state.get("simulator_pid", 0)},
+                {"Field": "Simulator running", "Value": demo_state.get("simulator_running", False)},
+                {"Field": "Process terminated", "Value": demo_state.get("terminated_process", "")},
+                {"Field": "Restored", "Value": demo_state.get("restored", "")},
+            ]
+        else:
+            state_rows = [
+                {"Field": "Device", "Value": demo_state.get("device_name", "")},
+                {"Field": "Demo root", "Value": demo_state.get("demo_root", "")},
+                {"Field": "DemoData exists", "Value": demo_state.get("demo_data_exists", False)},
+                {"Field": "DemoData_LOCKED exists", "Value": demo_state.get("locked", False)},
+                {"Field": "READ_ME.txt created", "Value": demo_state.get("readme_created", False)},
+                {"Field": "Simulator PID", "Value": demo_state.get("simulator_pid", 0)},
+                {"Field": "Simulator running", "Value": demo_state.get("simulator_running", False)},
+                {"Field": "Process terminated", "Value": demo_state.get("terminated_process", "")},
+            ]
+        st.dataframe(state_rows, use_container_width=True, hide_index=True)
+
+    network_ports = report.get("network_ports", [])
+    if network_ports:
+        st.markdown("#### Live Network Ports")
+        st.caption("This shows current listeners and connections. It can reveal possible transfer paths, but port state alone does not prove that files or screen data were sent.")
+        net_cols = st.columns(4)
+        network_metrics = [
+            ("Total ports", "total_ports"),
+            ("Listeners", "listeners"),
+            ("Public connections", "established_public_connections"),
+            ("Exposed listeners", "exposed_listeners"),
+        ]
+        for column, (label, key) in zip(net_cols, network_metrics):
+            with column:
+                st.metric(label, network_summary.get(key, 0))
+
+        st.dataframe(
+            [
+                {
+                    "Protocol": port["protocol"],
+                    "Local": f"{port['local_address']}:{port['local_port']}",
+                    "Remote": f"{port['remote_address']}:{port['remote_port']}" if port.get("remote_address") else "",
+                    "Remote Scope": port.get("remote_scope", ""),
+                    "Status": port.get("status", ""),
+                    "Exposure": port.get("listener_exposure", ""),
+                    "Process": port.get("process_name", ""),
+                    "PID": port.get("pid", 0),
+                }
+                for port in network_ports
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    demo_telemetry = report.get("demo_telemetry")
+    if demo_telemetry:
+        st.markdown("#### Local Demo Telemetry")
+        st.caption("Shown from local Streamlit session state. The demo checks whether the Desktop folder exists but does not read desktop files.")
+        st.dataframe(
+            [{"Field": key, "Value": value} for key, value in demo_telemetry.items()],
+            use_container_width=True,
+            hide_index=True,
+        )
 
     if events:
         st.markdown("#### Live Events")
@@ -704,19 +1073,25 @@ def main() -> None:
             - Convert images into `ASM`, `binary`, and `base64`
             - Preview images before processing
             - Scan uploaded files and inspect finding severity
+            - Check file hashes, signatures, and reputation
             - Run Windows live monitoring sessions
             - Export structured JSON reports
             """
         )
 
     render_hero()
-    convert_tab, scan_tab, monitor_tab = st.tabs(["Converter", "Scanner", "Live Monitoring"])
+    convert_tab, scan_tab, reputation_tab, monitor_tab = st.tabs(
+        ["Converter", "Scanner", "File Reputation", "Live Monitoring"]
+    )
 
     with convert_tab:
         render_converter_tab()
 
     with scan_tab:
         render_scanner_tab()
+
+    with reputation_tab:
+        render_reputation_tab()
 
     with monitor_tab:
         render_live_monitoring_tab()

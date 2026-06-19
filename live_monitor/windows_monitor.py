@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import ipaddress
 import os
 import platform
 import re
 import shlex
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable
 
 try:
@@ -52,6 +55,55 @@ class ThreadInfo:
     owner_pid: int
     start_address: int | None = None
     start_region: MemoryRegion | None = None
+
+
+@dataclass(frozen=True)
+class NetworkPortInfo:
+    protocol: str
+    local_address: str
+    local_port: int
+    remote_address: str = ""
+    remote_port: int = 0
+    status: str = ""
+    pid: int = 0
+    process_name: str = ""
+    process_path: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, int, str, int, str, int]:
+        return (
+            self.protocol,
+            self.local_address,
+            self.local_port,
+            self.remote_address,
+            self.remote_port,
+            self.status,
+            self.pid,
+        )
+
+    @property
+    def direction(self) -> str:
+        if self.status.upper() == "LISTEN":
+            return "listening"
+        if self.remote_address:
+            return "connected"
+        return "open"
+
+    def as_dict(self) -> dict:
+        return {
+            "protocol": self.protocol,
+            "local_address": self.local_address,
+            "local_port": self.local_port,
+            "remote_address": self.remote_address,
+            "remote_port": self.remote_port,
+            "remote_scope": network_address_scope(self.remote_address),
+            "status": self.status,
+            "direction": self.direction,
+            "pid": self.pid,
+            "process_name": self.process_name,
+            "process_path": self.process_path,
+            "listener_exposure": listener_exposure(self.local_address, self.status),
+        }
 
 
 @dataclass
@@ -111,10 +163,58 @@ class MonitorConfig:
     max_regions_per_process: int = 2048
     max_events: int = 500
     include_process_starts: bool = True
+    inspect_network_ports: bool = True
+    max_network_connections: int = 500
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def network_address_scope(address: str) -> str:
+    if not address:
+        return ""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return "name"
+    if ip.is_unspecified:
+        return "all_interfaces"
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_private:
+        return "private"
+    if ip.is_link_local:
+        return "link_local"
+    if ip.is_multicast:
+        return "multicast"
+    return "public"
+
+
+def listener_exposure(address: str, status: str) -> str:
+    if status.upper() != "LISTEN":
+        return ""
+    scope = network_address_scope(address)
+    if scope == "all_interfaces":
+        return "all_interfaces"
+    if scope in {"public", "private"}:
+        return scope
+    return "local_only"
+
+
+def collect_demo_system_telemetry() -> dict[str, str | bool]:
+    """Collect intentionally low-sensitivity host facts for the local demo."""
+    desktop_path = Path.home() / "Desktop"
+    return {
+        "device_name": platform.node() or "unknown",
+        "os_name": platform.system() or "unknown",
+        "os_release": platform.release() or "unknown",
+        "os_version": platform.version() or "unknown",
+        "architecture": platform.machine() or "unknown",
+        "desktop_folder_present": desktop_path.exists(),
+        "desktop_probe_scope": "existence check only; no desktop files are read",
+        "destination": "local Streamlit session state",
+    }
 
 
 class WindowsApiProbe:
@@ -503,6 +603,20 @@ class WindowsApiProbe:
 
 
 class BehaviorRuleEngine:
+    REMOTE_CONTROL_OR_FILE_PORTS = {
+        20: "FTP data",
+        21: "FTP control",
+        22: "SSH/SFTP",
+        445: "SMB file sharing",
+        548: "AFP file sharing",
+        873: "rsync",
+        3389: "Remote Desktop",
+        5900: "VNC remote screen",
+        5938: "TeamViewer",
+        6568: "AnyDesk",
+        7070: "Real-time media",
+        9001: "Tor relay/control-adjacent",
+    }
     SCRIPT_OR_LOLBIN_NAMES = {
         "powershell.exe",
         "pwsh.exe",
@@ -749,6 +863,78 @@ class BehaviorRuleEngine:
 
         return events
 
+    def reconnaissance_sleep_event(
+        self,
+        process: ProcessInfo,
+        telemetry: dict[str, str | bool],
+        sleep_seconds: float,
+    ) -> MonitorEvent:
+        return self._event(
+            "MEDIUM",
+            "demo_reconnaissance_then_sleep",
+            process,
+            f"{process.name} collected local host-profile telemetry and entered a demo sleep interval",
+            25,
+            evidence={
+                "device_name": telemetry.get("device_name", "unknown"),
+                "os_name": telemetry.get("os_name", "unknown"),
+                "os_release": telemetry.get("os_release", "unknown"),
+                "desktop_folder_present": telemetry.get("desktop_folder_present", False),
+                "sleep_seconds": round(float(sleep_seconds), 3),
+                "destination": telemetry.get("destination", "local Streamlit session state"),
+                "scope": telemetry.get("desktop_probe_scope", "local demo telemetry"),
+            },
+        )
+
+    def network_port_events(self, port: NetworkPortInfo) -> list[MonitorEvent]:
+        events: list[MonitorEvent] = []
+        process = ProcessInfo(
+            pid=port.pid,
+            parent_pid=0,
+            name=port.process_name or "unknown",
+            path=port.process_path,
+        )
+        exposure = listener_exposure(port.local_address, port.status)
+
+        if exposure == "all_interfaces":
+            events.append(
+                self._event(
+                    "LOW",
+                    "network_listener_all_interfaces",
+                    process,
+                    f"{process.name} is listening on {port.protocol}/{port.local_port} across all interfaces",
+                    10,
+                    evidence=port.as_dict(),
+                )
+            )
+        elif exposure in {"public", "private"}:
+            events.append(
+                self._event(
+                    "LOW",
+                    "network_listener_reachable_interface",
+                    process,
+                    f"{process.name} is listening on {port.protocol}/{port.local_port} on a {exposure} address",
+                    10,
+                    evidence=port.as_dict(),
+                )
+            )
+
+        remote_scope = network_address_scope(port.remote_address)
+        watched_service = self.REMOTE_CONTROL_OR_FILE_PORTS.get(port.remote_port)
+        if port.remote_address and remote_scope == "public" and watched_service:
+            events.append(
+                self._event(
+                    "MEDIUM",
+                    "public_remote_control_or_file_port",
+                    process,
+                    f"{process.name} has a public connection to {watched_service} port {port.remote_port}",
+                    25,
+                    evidence=port.as_dict(),
+                )
+            )
+
+        return events
+
     def thread_start_events(self, thread: ThreadInfo, owner: ProcessInfo | None) -> list[MonitorEvent]:
         if not owner or not thread.start_region:
             return []
@@ -960,6 +1146,12 @@ class WindowsBehaviorMonitor:
         seen_threads = {thread.tid for thread in self.probe.iter_threads()}
         seen_regions: dict[int, set[tuple[int, int, int]]] = {}
         watched_regions: dict[tuple[int, int], WatchedRegion] = {}
+        network_ports: list[NetworkPortInfo] = []
+        seen_network_ports: set[tuple[str, str, int, str, int, str, int]] = set()
+
+        if self.config.inspect_network_ports:
+            network_ports = self.collect_live_ports(baseline_processes)
+            seen_network_ports = {port.key for port in network_ports}
 
         if self.config.inspect_memory_regions:
             for process in self._memory_scan_candidates(baseline_processes, set()):
@@ -978,6 +1170,14 @@ class WindowsBehaviorMonitor:
 
             processes = self._process_map()
             new_pids = set(processes) - seen_pids
+
+            if self.config.inspect_network_ports:
+                network_ports = self.collect_live_ports(processes)
+                for port in network_ports:
+                    if port.key in seen_network_ports:
+                        continue
+                    seen_network_ports.add(port.key)
+                    events.extend(self.rule_engine.network_port_events(port))
 
             if self.config.include_process_starts:
                 for pid in sorted(new_pids):
@@ -1049,9 +1249,45 @@ class WindowsBehaviorMonitor:
             "started_at": started_at,
             "ended_at": utc_now(),
             "events": [event.as_dict() for event in events],
-            "summary": self._summary(events),
+            "summary": self._summary(events, network_ports),
             "configuration": self._configuration_dict(),
+            "network_ports": [port.as_dict() for port in network_ports],
+            "network_summary": self._network_summary(network_ports),
             "message": "Monitoring session completed.",
+        }
+
+    def port_check_report(self) -> dict:
+        started_at = utc_now()
+        if psutil is None:
+            return {
+                "supported": False,
+                "started_at": started_at,
+                "ended_at": utc_now(),
+                "events": [],
+                "summary": self._port_check_summary([], []),
+                "configuration": self._configuration_dict(),
+                "network_ports": [],
+                "network_summary": self._network_summary([]),
+                "message": "Port checking requires psutil. Install dependencies with requirements.txt.",
+            }
+
+        processes = self._process_map() if self.is_supported else {}
+        ports = self.collect_live_ports(processes)
+        events: list[MonitorEvent] = []
+        for port in ports:
+            events.extend(self.rule_engine.network_port_events(port))
+
+        return {
+            "supported": True,
+            "port_check": True,
+            "started_at": started_at,
+            "ended_at": utc_now(),
+            "events": [event.as_dict() for event in events],
+            "summary": self._port_check_summary(events, ports),
+            "configuration": self._configuration_dict(),
+            "network_ports": [port.as_dict() for port in ports],
+            "network_summary": self._network_summary(ports),
+            "message": "Live port check completed. Port state indicates possible communication paths, not proof of file or screen data transfer.",
         }
 
     def _watch_region(
@@ -1192,7 +1428,89 @@ class WindowsBehaviorMonitor:
             "message": "Self-test report generated from synthetic anti-injection rule events.",
         }
 
+    def demo_recon_sleep_report(self, sleep_seconds: float = 3.0, progress_callback=None) -> dict:
+        """Run a local telemetry-and-sleep demonstration and return a monitor report."""
+        started_at = utc_now()
+        sleep_seconds = max(0.0, float(sleep_seconds))
+        if progress_callback:
+            progress_callback(0.1)
+
+        telemetry = collect_demo_system_telemetry()
+        current_process = ProcessInfo(
+            pid=self.current_pid,
+            parent_pid=os.getppid(),
+            name=Path(os.path.basename(__file__)).stem,
+            path=__file__,
+        )
+        event = self.rule_engine.reconnaissance_sleep_event(current_process, telemetry, sleep_seconds)
+
+        if progress_callback:
+            progress_callback(0.45)
+        if sleep_seconds:
+            time.sleep(sleep_seconds)
+        if progress_callback:
+            progress_callback(1.0)
+
+        events = [event]
+        return {
+            "supported": True,
+            "self_test": True,
+            "demo_type": "local_reconnaissance_sleep",
+            "started_at": started_at,
+            "ended_at": utc_now(),
+            "events": [event.as_dict() for event in events],
+            "summary": self._summary(events),
+            "configuration": {
+                **self._configuration_dict(),
+                "demo_sleep_seconds": sleep_seconds,
+            },
+            "demo_telemetry": telemetry,
+            "message": "Local demo collected low-sensitivity host telemetry, displayed it in Streamlit, and emitted a sleep-pattern detection event.",
+        }
+
+    def collect_live_ports(self, processes: dict[int, ProcessInfo] | None = None) -> list[NetworkPortInfo]:
+        if psutil is None:
+            return []
+
+        process_map = processes or {}
+        ports: list[NetworkPortInfo] = []
+        for connection in psutil.net_connections(kind="inet"):
+            if len(ports) >= self.config.max_network_connections:
+                break
+            local_address, local_port = self._socket_address_parts(connection.laddr)
+            remote_address, remote_port = self._socket_address_parts(connection.raddr)
+            pid = int(connection.pid or 0)
+            process = process_map.get(pid) or self._psutil_process_info(pid)
+            protocol = "TCP" if connection.type == socket.SOCK_STREAM else "UDP"
+            ports.append(
+                NetworkPortInfo(
+                    protocol=protocol,
+                    local_address=local_address,
+                    local_port=local_port,
+                    remote_address=remote_address,
+                    remote_port=remote_port,
+                    status=connection.status or ("OPEN" if protocol == "UDP" else ""),
+                    pid=pid,
+                    process_name=process.name if process else "",
+                    process_path=process.path if process else "",
+                )
+            )
+
+        ports.sort(
+            key=lambda port: (
+                port.direction != "listening",
+                port.protocol,
+                port.local_port,
+                port.process_name.lower(),
+                port.remote_address,
+                port.remote_port,
+            )
+        )
+        return ports
+
     def _process_map(self) -> dict[int, ProcessInfo]:
+        if not self.probe:
+            return {}
         return {process.pid: process for process in self.probe.iter_processes()}
 
     def _with_signature(self, process: ProcessInfo) -> ProcessInfo:
@@ -1217,7 +1535,33 @@ class WindowsBehaviorMonitor:
         return bool(process and process.parent_pid == self.current_pid)
 
     @staticmethod
-    def _summary(events: list[MonitorEvent]) -> dict:
+    def _socket_address_parts(address) -> tuple[str, int]:
+        if not address:
+            return "", 0
+        try:
+            return str(address.ip), int(address.port)
+        except AttributeError:
+            if isinstance(address, tuple) and len(address) >= 2:
+                return str(address[0]), int(address[1])
+        return "", 0
+
+    @staticmethod
+    def _psutil_process_info(pid: int) -> ProcessInfo | None:
+        if not pid or psutil is None:
+            return None
+        try:
+            process = psutil.Process(pid)
+            return ProcessInfo(
+                pid=pid,
+                parent_pid=int(process.ppid() or 0),
+                name=process.name() or "",
+                path=process.exe() or "",
+            )
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            return ProcessInfo(pid=pid, parent_pid=0, name="", path="")
+
+    @staticmethod
+    def _summary(events: list[MonitorEvent], ports: list[NetworkPortInfo] | None = None) -> dict:
         severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         category_counts: dict[str, int] = {}
         risk_score = 0
@@ -1230,7 +1574,37 @@ class WindowsBehaviorMonitor:
             "event_count": len(events),
             "severity_counts": severity_counts,
             "category_counts": category_counts,
+            "network": WindowsBehaviorMonitor._network_summary(ports or []),
         }
+
+    @staticmethod
+    def _network_summary(ports: list[NetworkPortInfo]) -> dict:
+        public_connections = [
+            port
+            for port in ports
+            if port.remote_address and network_address_scope(port.remote_address) == "public"
+        ]
+        listeners = [port for port in ports if port.direction == "listening"]
+        exposed_listeners = [
+            port
+            for port in listeners
+            if listener_exposure(port.local_address, port.status) in {"all_interfaces", "public", "private"}
+        ]
+        return {
+            "total_ports": len(ports),
+            "listeners": len(listeners),
+            "established_public_connections": len(public_connections),
+            "exposed_listeners": len(exposed_listeners),
+            "unknown_process_ports": sum(1 for port in ports if not port.process_name),
+            "truncated": len(ports) > 0 and len(ports) >= MonitorConfig().max_network_connections,
+        }
+
+    @staticmethod
+    def _port_check_summary(events: list[MonitorEvent], ports: list[NetworkPortInfo]) -> dict:
+        summary = WindowsBehaviorMonitor._summary(events, ports)
+        summary["risk_score"] = max((event.score for event in events), default=0)
+        summary["score_model"] = "max_single_port_exposure"
+        return summary
 
     def _configuration_dict(self) -> dict:
         return {
@@ -1243,4 +1617,6 @@ class WindowsBehaviorMonitor:
             "max_processes_per_cycle": self.config.max_processes_per_cycle,
             "max_regions_per_process": self.config.max_regions_per_process,
             "include_process_starts": self.config.include_process_starts,
+            "inspect_network_ports": self.config.inspect_network_ports,
+            "max_network_connections": self.config.max_network_connections,
         }

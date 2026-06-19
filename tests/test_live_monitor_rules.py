@@ -2,20 +2,25 @@ import sys
 import unittest
 from pathlib import Path
 
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
 
 from live_monitor.windows_monitor import (
     BehaviorRuleEngine,
     MemoryRegion,
     MonitorConfig,
+    NetworkPortInfo,
     ProcessInfo,
     ThreadInfo,
     WindowsBehaviorMonitor,
     WindowsApiProbe,
+    collect_demo_system_telemetry,
+    listener_exposure,
+    network_address_scope,
 )
-
 
 class LiveMonitorRuleTests(unittest.TestCase):
     def setUp(self):
@@ -222,6 +227,100 @@ class LiveMonitorRuleTests(unittest.TestCase):
         self.assertIn("private_executable_thread_start", categories)
         self.assertIn("sleep_obfuscation_page_transition", categories)
         self.assertGreater(report["summary"]["risk_score"], 0)
+
+    def test_demo_telemetry_is_low_sensitivity_and_local_only(self):
+        telemetry = collect_demo_system_telemetry()
+
+        self.assertIn("device_name", telemetry)
+        self.assertIn("os_version", telemetry)
+        self.assertEqual(telemetry["destination"], "local Streamlit session state")
+        self.assertEqual(telemetry["desktop_probe_scope"], "existence check only; no desktop files are read")
+
+    def test_demo_recon_sleep_report_contains_detection_event_and_telemetry(self):
+        report = WindowsBehaviorMonitor(MonitorConfig(duration_seconds=5)).demo_recon_sleep_report(sleep_seconds=0)
+        categories = {event["category"] for event in report["events"]}
+
+        self.assertTrue(report["self_test"])
+        self.assertEqual(report["demo_type"], "local_reconnaissance_sleep")
+        self.assertIn("demo_reconnaissance_then_sleep", categories)
+        self.assertIn("demo_telemetry", report)
+        self.assertGreater(report["summary"]["risk_score"], 0)
+        self.assertEqual(report["configuration"]["demo_sleep_seconds"], 0.0)
+
+    def test_network_address_scope_classifies_public_and_local_addresses(self):
+        self.assertEqual(network_address_scope("8.8.8.8"), "public")
+        self.assertEqual(network_address_scope("127.0.0.1"), "loopback")
+        self.assertEqual(network_address_scope("0.0.0.0"), "all_interfaces")
+        self.assertEqual(listener_exposure("0.0.0.0", "LISTEN"), "all_interfaces")
+
+    def test_all_interface_listener_is_reported_as_low_risk(self):
+        port = NetworkPortInfo(
+            protocol="TCP",
+            local_address="0.0.0.0",
+            local_port=8080,
+            status="LISTEN",
+            pid=1234,
+            process_name="sharing.exe",
+            process_path=r"C:\Tools\sharing.exe",
+        )
+
+        events = self.rules.network_port_events(port)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].severity, "LOW")
+        self.assertEqual(events[0].category, "network_listener_all_interfaces")
+
+    def test_public_remote_control_or_file_port_is_reported(self):
+        port = NetworkPortInfo(
+            protocol="TCP",
+            local_address="192.168.1.20",
+            local_port=51555,
+            remote_address="8.8.8.8",
+            remote_port=3389,
+            status="ESTABLISHED",
+            pid=1234,
+            process_name="remote.exe",
+        )
+
+        events = self.rules.network_port_events(port)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].category, "public_remote_control_or_file_port")
+
+    def test_network_summary_counts_live_ports(self):
+        ports = [
+            NetworkPortInfo(protocol="TCP", local_address="0.0.0.0", local_port=8080, status="LISTEN"),
+            NetworkPortInfo(
+                protocol="TCP",
+                local_address="192.168.1.20",
+                local_port=51555,
+                remote_address="8.8.8.8",
+                remote_port=3389,
+                status="ESTABLISHED",
+            ),
+        ]
+
+        summary = WindowsBehaviorMonitor._network_summary(ports)
+
+        self.assertEqual(summary["total_ports"], 2)
+        self.assertEqual(summary["listeners"], 1)
+        self.assertEqual(summary["established_public_connections"], 1)
+        self.assertEqual(summary["exposed_listeners"], 1)
+
+    def test_port_check_summary_uses_max_single_exposure_score(self):
+        ports = [
+            NetworkPortInfo(protocol="TCP", local_address="0.0.0.0", local_port=8000, status="LISTEN"),
+            NetworkPortInfo(protocol="TCP", local_address="0.0.0.0", local_port=8001, status="LISTEN"),
+        ]
+        events = []
+        for port in ports:
+            events.extend(self.rules.network_port_events(port))
+
+        summary = WindowsBehaviorMonitor._port_check_summary(events, ports)
+
+        self.assertEqual(summary["risk_score"], 10)
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["score_model"], "max_single_port_exposure")
 
     @staticmethod
     def _watched_region(previous_protection: int):
